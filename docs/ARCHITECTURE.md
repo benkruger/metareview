@@ -39,6 +39,11 @@ abbreviated — task-done/epic-ready/pr-ready also take `--evidence <file>` (a v
 | **epic-ready** | `review epic-ready <id>` | the epic's **integration diff** (base..HEAD, the union of the children's changes), **with the roll-up as context** — child evidence present? contradictions? intent drift? registry coverage? | deterministic heuristics (roll-up freshness) **+ a required adjudicated review** over the integration diff (base..HEAD) via the `epic-review-loop` workflow — same require-lenses gate as pr-ready/task-done |
 | **learn** | `learn --post-merge <pr>` | what the merged PR + bot findings teach us | learning extraction |
 
+`source-review` is a separate command (`source-review --model astra|opus|grok --output <dir> [<repo>]`).
+It reviews the first-party source at HEAD — code `Classify` keeps, minus tests, vendored trees,
+generated files, and non-UTF-8 — by calling the logged-in `claude`, `codex`, or `grok` CLI.
+It does not use the diff-review anchor gate, `ValidatePayload`, `internal/shardpack`, or `review-lenses`.
+
 `epic-ready` runs *after* every child task is task-done-reviewed. It reviews the epic's **integration diff**
 (base..HEAD, the union of the children's changes) **with the roll-up — child review logs, evidence, parent
 intent — as context**; the roll-up's own freshness is guarded by the deterministic pre-checks (re-read every
@@ -201,7 +206,8 @@ list below is illustrative, omitting e.g. `judge`, `gate`, `converge`, `export`)
   `BuildForBranch`, coverage/unreviewed), `githooktest` (black-box hook tests), `covergate` (floor gate).
 - **Context & evidence:** `gitcontext` (exclude-filtered diff), `githubcontext`, `contextpack`,
   `contextprofile`, `shardpack` (shard packs), `evidence`, `mutation` (Stryker/gremlins report), `knowledge`,
-  `markdown`, `classify` (file class), `testconv` (test-file convention).
+  `markdown`, `classify` (file class), `testconv` (test-file convention),
+  `sourcereview` (whole-repo first-party source review; not the diff gate).
 - **FSM:** `fsm/{cli,machine,workflow,run,record,sandbox,kind}`.
 - **Sources & learning:** `tasksource`, `epicsource` (Beads etc.), `learning`, `learnsource`,
   `sessionhistory`, `integration` (metaswarm).

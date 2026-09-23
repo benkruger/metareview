@@ -32,6 +32,7 @@ import (
 	"github.com/dsifry/metareview/internal/reviewprompt"
 	"github.com/dsifry/metareview/internal/reviewstate"
 	"github.com/dsifry/metareview/internal/setup"
+	"github.com/dsifry/metareview/internal/sourcereview"
 	"github.com/dsifry/metareview/internal/status"
 	"github.com/dsifry/metareview/internal/taskdone"
 	"github.com/dsifry/metareview/internal/version"
@@ -120,6 +121,7 @@ Usage:
   metareview review pr-ready [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--github-pr <number>] [--include-working-tree] [--shard-result <path>]... [--cross-shard-result <path>]
   metareview review record-lenses [--scope pr-ready|task-done|epic-ready] [--base <ref>] [--verdict <v>] [--mode subagent-adjudicated|in-session-emulated] [--lenses a,b,c] [--from-run <fsm-run-id>]
   metareview learn --post-merge <pr-number> [--base <ref>] [--github-pr <number>] [--session-root <path>]
+  metareview source-review --model astra|opus|grok --output <dir> [<repo>]
 
 Commands:
   setup --check              Detect repository mode and prerequisites without writing files
@@ -142,6 +144,7 @@ Commands:
   review pr-ready            Run PR-ready branch review
   review record-lenses       Record an adjudicated lens review over HEAD (satisfies the require-lenses gate)
   learn --post-merge         Curate post-merge repository learning
+  source-review              Review first-party source with Astra, Opus, or Grok
 `, version.Version)
 }
 
@@ -165,6 +168,10 @@ func dispatch(args []string) {
 	if args[0] == "--version" || args[0] == "-v" {
 		_, _ = fmt.Fprintln(stdout, version.Version)
 		return
+	}
+
+	if args[0] == "source-review" {
+		exit(sourcereview.CLI(args[1:], workdir, stdout, stderr))
 	}
 
 	if len(args) >= 1 && args[0] == "setup" {
