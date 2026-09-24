@@ -40,9 +40,9 @@ abbreviated — task-done/epic-ready/pr-ready also take `--evidence <file>` (a v
 | **learn** | `learn --post-merge <pr>` | what the merged PR + bot findings teach us | learning extraction |
 
 `source-review` is a separate command (`source-review --model astra|opus|grok --output <dir> [--jobs <n>]
-[--call-timeout <duration>] [<repo>]`).
+[--call-timeout <duration>] [--path <path>]... [<repo>]`).
 It reviews the first-party source at HEAD — code `Classify` keeps, minus tests, vendored trees,
-generated files, and non-UTF-8 — by calling the logged-in `claude`, `codex`, or `grok` CLI, up to `--jobs`
+generated files, and non-UTF-8, narrowed to `--path` when given (a sample of the real checkout) — by calling the logged-in `claude`, `codex`, or `grok` CLI, up to `--jobs`
 prompts at once (default 8), each call killed with its process group past `--call-timeout` (default 30m).
 Grok runs as one tool-less turn (`--prompt-file --verbatim --json-schema --tools "" --max-turns 1
 --system-prompt-override`): `grok -p` hands a large prompt to its agent as an excerpt it re-reads with tools.

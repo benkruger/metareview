@@ -398,6 +398,49 @@ func TestRunFailureStopsNewCalls(t *testing.T) {
 	}
 }
 
+func TestRunPaths(t *testing.T) {
+	root, _ := newRepoBytes(t, specFiles())
+	run := func(paths ...string) (string, [][]byte, error) {
+		var buf bytes.Buffer
+		fr := &fakeRunner{reply: func(int, string, []string, []byte) ([]byte, error) {
+			return cliStdout("opus", `{"findings":[]}`), nil
+		}}
+		err := Run(Options{Repo: root, Model: "opus", OutputDir: t.TempDir(), Stdout: &buf, Paths: paths, Runner: fr})
+		var prompts [][]byte
+		for _, c := range fr.callList() {
+			prompts = append(prompts, c.prompt)
+		}
+		return buf.String(), prompts, err
+	}
+	// One file: only it is listed as kept and only it is sent.
+	out, prompts, err := run("pkg/app.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "kept:\npkg/app.go\ndropped:\n") || len(prompts) != 1 || !bytes.Contains(prompts[0], []byte("pkg/app.go\n")) || bytes.Contains(prompts[0], []byte("pkg/note.go")) {
+		t.Fatalf("one file:\n%s", out)
+	}
+	// A directory, written with a trailing slash, and "." both keep everything under them.
+	for _, p := range []string{"pkg/", "."} {
+		out, _, err = run(p)
+		if err != nil || !strings.Contains(out, "kept:\npkg/app.go\npkg/note.go\ndropped:\n") {
+			t.Fatalf("%s: %v\n%s", p, err, out)
+		}
+	}
+	// Repeated paths add up.
+	out, _, err = run("pkg/note.go", "pkg/app.go")
+	if err != nil || !strings.Contains(out, "kept:\npkg/app.go\npkg/note.go\n") {
+		t.Fatalf("two paths: %v\n%s", err, out)
+	}
+	// A partial name, a dropped file, and a missing file match nothing and call no model.
+	for _, p := range []string{"pkg/ap", "vendor/lib.go", "nope.go"} {
+		_, prompts, err = run("pkg/app.go", p)
+		if err == nil || !strings.Contains(err.Error(), "--path "+p+" matches no kept file") || len(prompts) != 0 {
+			t.Fatalf("%s: err=%v prompts=%d", p, err, len(prompts))
+		}
+	}
+}
+
 func TestRunBadJobsAndTimeout(t *testing.T) {
 	root, _ := newRepoBytes(t, specFiles())
 	fr := &fakeRunner{}
@@ -707,9 +750,12 @@ func TestCLI(t *testing.T) {
 	if err != nil || DefaultJobs != 8 || DefaultCallTimeout != 30*time.Minute || a.jobs != DefaultJobs || a.timeout != DefaultCallTimeout {
 		t.Fatalf("defaults %+v %v", a, err)
 	}
-	a, err = parseArgs([]string{"--model", "grok", "--output", "o", "--jobs", "3", "--call-timeout", "90s", "repo"})
-	if err != nil || a.jobs != 3 || a.timeout != 90*time.Second || a.repo != "repo" {
+	a, err = parseArgs([]string{"--model", "grok", "--output", "o", "--jobs", "3", "--call-timeout", "90s", "--path", "a.go", "--path", "web/src", "repo"})
+	if err != nil || a.jobs != 3 || a.timeout != 90*time.Second || a.repo != "repo" || !reflectArgs(a.paths, []string{"a.go", "web/src"}) {
 		t.Fatalf("flags %+v %v", a, err)
+	}
+	if _, err := parseArgs([]string{"--model", "grok", "--output", "o", "--path"}); err == nil {
+		t.Fatal("--path needs a value")
 	}
 	root, commit := newRepoBytes(t, droppedOnlyFiles())
 	outDir := t.TempDir()

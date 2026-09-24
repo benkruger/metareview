@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -17,14 +18,16 @@ import (
 )
 
 const usageText = `Usage: metareview source-review --model astra|opus|grok --output <dir>
-                              [--jobs <n>] [--call-timeout <duration>] [<repo>]
+                              [--jobs <n>] [--call-timeout <duration>] [--path <path>]... [<repo>]
 
 Reviews the first-party source at HEAD. Prints the kept list and the dropped
 list before any model call. Writes <dir>/findings.json and <dir>/review.html.
 The output directory must be outside the repository.
 
 --jobs runs up to n prompts at once (default 8). --call-timeout limits each
-model call (default 30m); a call that runs past it fails the run.`
+model call (default 30m); a call that runs past it fails the run. --path
+reviews only the kept files at that path or under that directory; repeat it
+to review several. A --path that matches no kept file fails the run.`
 
 // DefaultJobs and DefaultCallTimeout apply when Options leaves them zero.
 const (
@@ -55,11 +58,14 @@ type Options struct {
 	Budget      int
 	Jobs        int
 	CallTimeout time.Duration
-	Runner      Runner
-	Git         GitFunc
-	MkdirAll    func(string, os.FileMode) error
-	WriteFile   func(string, []byte, os.FileMode) error
-	Remove      func(string) error
+	// Paths, when set, limits the review to kept files at or under these
+	// repo-relative paths. Every path must match at least one kept file.
+	Paths     []string
+	Runner    Runner
+	Git       GitFunc
+	MkdirAll  func(string, os.FileMode) error
+	WriteFile func(string, []byte, os.FileMode) error
+	Remove    func(string) error
 }
 
 // Run reviews one repository. It writes the findings file and the page only
@@ -90,6 +96,10 @@ func Run(opts Options) error {
 		return err
 	}
 	kept, dropped, commit, err := Select(top, git)
+	if err != nil {
+		return err
+	}
+	kept, err = onlyPaths(kept, opts.Paths)
 	if err != nil {
 		return err
 	}
@@ -211,6 +221,36 @@ func writePrompt(w io.Writer, p []byte) {
 		fmt.Fprintln(w)
 	}
 	fmt.Fprintln(w, "prompt-end")
+}
+
+// onlyPaths keeps the files at or under any of paths. No paths keeps every
+// file. A path that matches no kept file is an error, so a typo or a file the
+// source cut dropped is reported instead of reviewing nothing.
+func onlyPaths(kept []File, paths []string) ([]File, error) {
+	if len(paths) == 0 {
+		return kept, nil
+	}
+	var out []File
+	matched := make([]bool, len(paths))
+	for _, f := range kept {
+		hit := false
+		for i, p := range paths {
+			p = path.Clean(p)
+			if f.Path == p || strings.HasPrefix(f.Path, p+"/") || p == "." {
+				matched[i] = true
+				hit = true
+			}
+		}
+		if hit {
+			out = append(out, f)
+		}
+	}
+	for i, ok := range matched {
+		if !ok {
+			return nil, fmt.Errorf("--path %s matches no kept file", paths[i])
+		}
+	}
+	return out, nil
 }
 
 func writeLists(w io.Writer, kept []File, dropped []string) {
@@ -354,6 +394,7 @@ func CLI(args []string, cwd string, stdout, stderr io.Writer) int {
 		Stdout:      stdout,
 		Stderr:      stderr,
 		Jobs:        a.jobs,
+		Paths:       a.paths,
 		CallTimeout: a.timeout,
 		Runner:      OSRunner{},
 	})
@@ -368,6 +409,7 @@ type cliArgs struct {
 	model, out, repo string
 	jobs             int
 	timeout          time.Duration
+	paths            []string
 }
 
 func parseArgs(args []string) (cliArgs, error) {
@@ -377,7 +419,7 @@ func parseArgs(args []string) (cliArgs, error) {
 		switch {
 		case arg == "--help" || arg == "-h":
 			return cliArgs{}, errHelp
-		case arg == "--model" || arg == "--output" || arg == "--jobs" || arg == "--call-timeout":
+		case arg == "--model" || arg == "--output" || arg == "--jobs" || arg == "--call-timeout" || arg == "--path":
 			if i+1 >= len(args) {
 				return cliArgs{}, fmt.Errorf("missing value for %s", arg)
 			}
@@ -406,6 +448,8 @@ func (a *cliArgs) set(flag, v string) error {
 		a.model = v
 	case "--output":
 		a.out = v
+	case "--path":
+		a.paths = append(a.paths, v)
 	case "--jobs":
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
