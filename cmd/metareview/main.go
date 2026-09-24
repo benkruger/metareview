@@ -121,7 +121,7 @@ Usage:
   metareview review pr-ready [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--github-pr <number>] [--include-working-tree] [--shard-result <path>]... [--cross-shard-result <path>]
   metareview review record-lenses [--scope pr-ready|task-done|epic-ready] [--base <ref>] [--verdict <v>] [--mode subagent-adjudicated|in-session-emulated] [--lenses a,b,c] [--from-run <fsm-run-id>]
   metareview learn --post-merge <pr-number> [--base <ref>] [--github-pr <number>] [--session-root <path>]
-  metareview source-review --model astra|opus|grok --output <dir> [<repo>]
+  metareview source-review --model astra|opus|grok --output <dir> [--jobs <n>] [--call-timeout <duration>] [<repo>]
 
 Commands:
   setup --check              Detect repository mode and prerequisites without writing files

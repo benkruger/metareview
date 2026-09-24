@@ -91,7 +91,7 @@ func TestRunSourceReviewHelp(t *testing.T) {
 		t.Fatalf("code=%d out=%q err=%q", code, out, errOut)
 	}
 	code, help, _ := runCLI(t, t.TempDir(), nil, "--help")
-	if code != 0 || !strings.Contains(help, "metareview source-review --model astra|opus|grok --output <dir> [<repo>]") {
+	if code != 0 || !strings.Contains(help, "metareview source-review --model astra|opus|grok --output <dir> [--jobs <n>] [--call-timeout <duration>] [<repo>]") {
 		t.Fatalf("top-level help missing source-review: %q", help)
 	}
 }

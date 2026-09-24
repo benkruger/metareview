@@ -2,6 +2,7 @@ package sourcereview
 
 import (
 	"bytes"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,7 +34,7 @@ func TestPackWholeFilesSmallest(t *testing.T) {
 			t.Fatal("whole file prompt has a slice note")
 		}
 		for _, f := range files {
-			needle := append([]byte(f.Path+"\n"), f.Body...)
+			needle := append([]byte(f.Path+"\n"), numberLines(f.Body, 1)...)
 			if bytes.Contains(p, needle) {
 				seen[f.Path]++
 			}
@@ -67,7 +68,14 @@ func TestPackSlicesPartitionUTF8(t *testing.T) {
 		if !strings.HasPrefix(string(p), prefix) {
 			t.Fatalf("prompt missing slice header at offset %d", off)
 		}
-		part := p[len(prefix):]
+		// The body has no newlines, so each slice is one numbered line: the
+		// original line that holds the slice's first byte.
+		numbered := p[len(prefix):]
+		mark := strconv.Itoa(lineAt(body, off)) + "| "
+		if !bytes.HasPrefix(numbered, []byte(mark)) {
+			t.Fatalf("slice at offset %d is not numbered %q", off, mark)
+		}
+		part := numbered[len(mark):]
 		if len(part) == 0 {
 			t.Fatal("empty slice")
 		}
@@ -141,6 +149,11 @@ func TestCutEndAndSliceErrors(t *testing.T) {
 	if err != nil || end != 2 {
 		t.Fatalf("short end=%d err=%v", end, err)
 	}
+	// Room exactly equal to the bytes left takes the rest without reading past the end.
+	end, err = cutEnd([]byte("abc"), 1, 2)
+	if err != nil || end != 3 {
+		t.Fatalf("exact end=%d err=%v", end, err)
+	}
 	header := sliceHeader("p.go", 1)
 	if _, err := sliceFile(File{Path: "p.go", Body: []byte("世")}, len(header)+len("p.go")+1+1); err == nil {
 		t.Fatal("sliceFile should reject a rune that does not fit")
@@ -169,10 +182,82 @@ func TestCutEndAndSliceErrors(t *testing.T) {
 func TestPromptNamesPathBeforeBody(t *testing.T) {
 	body := []byte("package pkg\nfunc A() {}\n")
 	p := promptWith(instruction, []File{{Path: "pkg/app.go", Body: body}})
-	if !bytes.Contains(p, append([]byte("pkg/app.go\n"), body...)) {
-		t.Fatalf("path is not immediately before the body:\n%s", p)
+	if !bytes.Contains(p, []byte("pkg/app.go\n1| package pkg\n2| func A() {}\n")) {
+		t.Fatalf("path is not immediately before the numbered body:\n%s", p)
 	}
-	if !bytes.Contains(p, []byte(`{"findings":[...]}`)) {
-		t.Fatal("instruction missing findings object")
+	if !bytes.Contains(p, []byte(`{"findings":[...]}`)) || !bytes.Contains(p, []byte("Cite those numbers.")) {
+		t.Fatal("instruction missing findings object or line-number note")
+	}
+}
+
+func TestNumberLines(t *testing.T) {
+	cases := []struct {
+		body  string
+		first int
+		want  string
+	}{
+		{"", 1, ""},
+		{"a\n", 1, "1| a\n"},
+		{"a\nb", 1, "1| a\n2| b"},
+		{"a\n\nb\n", 7, "7| a\n8| \n9| b\n"},
+	}
+	for _, c := range cases {
+		if got := string(numberLines([]byte(c.body), c.first)); got != c.want {
+			t.Fatalf("numberLines(%q, %d) = %q, want %q", c.body, c.first, got, c.want)
+		}
+	}
+}
+
+func TestSliceNumbersFromOriginalLine(t *testing.T) {
+	// 30,000 two-byte lines do not fit one prompt, and numbering more than
+	// doubles their size, so each cut has to shrink to fit the numbered text.
+	var body bytes.Buffer
+	for i := 1; i <= 30000; i++ {
+		body.WriteString("x\n")
+	}
+	f := File{Path: "short.go", Body: body.Bytes()}
+	const budget = 20000
+	prompts, err := sliceFile(f, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prompts) < 2 {
+		t.Fatalf("prompts = %d", len(prompts))
+	}
+	number := regexp.MustCompile(`(?m)^(\d+)\| `)
+	off := 0
+	for _, p := range prompts {
+		if len(p) > budget {
+			t.Fatalf("prompt is %d bytes", len(p))
+		}
+		numbered := p[bytes.Index(p, []byte("short.go\n"))+len("short.go\n"):]
+		first := number.FindSubmatch(numbered)
+		if first == nil || string(first[1]) != strconv.Itoa(lineAt(f.Body, off)) {
+			t.Fatalf("slice at offset %d starts at %q, want line %d", off, first, lineAt(f.Body, off))
+		}
+		part := number.ReplaceAll(numbered, nil)
+		if !bytes.HasPrefix(f.Body[off:], part) {
+			t.Fatalf("slice at offset %d is not the next bytes of the file", off)
+		}
+		off += len(part)
+	}
+	if off != len(f.Body) {
+		t.Fatalf("partition covered %d of %d", off, len(f.Body))
+	}
+}
+
+func TestCutNumbered(t *testing.T) {
+	// Numbered, "a\nb\nc" is 14 bytes for a room of 5; the cut shrinks until
+	// the numbered text fits.
+	end, err := cutNumbered([]byte("a\nb\nc\n"), 0, 5, 1)
+	if err != nil || end != 1 {
+		t.Fatalf("end=%d err=%v", end, err)
+	}
+	end, err = cutNumbered([]byte("abcdef"), 0, 5, 1)
+	if err != nil || end != 2 {
+		t.Fatalf("end=%d err=%v", end, err)
+	}
+	if _, err := cutNumbered([]byte("abc"), 0, 3, 100000); err == nil {
+		t.Fatal("a number wider than the room cannot fit")
 	}
 }

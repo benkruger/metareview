@@ -1,22 +1,36 @@
 package sourcereview
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/dsifry/metareview/internal/lensoutput"
 )
 
-const usageText = `Usage: metareview source-review --model astra|opus|grok --output <dir> [<repo>]
+const usageText = `Usage: metareview source-review --model astra|opus|grok --output <dir>
+                              [--jobs <n>] [--call-timeout <duration>] [<repo>]
 
 Reviews the first-party source at HEAD. Prints the kept list and the dropped
 list before any model call. Writes <dir>/findings.json and <dir>/review.html.
-The output directory must be outside the repository.`
+The output directory must be outside the repository.
+
+--jobs runs up to n prompts at once (default 8). --call-timeout limits each
+model call (default 30m); a call that runs past it fails the run.`
+
+// DefaultJobs and DefaultCallTimeout apply when Options leaves them zero.
+const (
+	DefaultJobs        = 8
+	DefaultCallTimeout = 30 * time.Minute
+)
 
 var errHelp = errors.New("help")
 
@@ -31,18 +45,21 @@ var (
 
 // Options is one source-review run. A nil Runner, Git, MkdirAll, WriteFile, or
 // Remove uses the real process, git, or filesystem. Budget 0 means MaxPromptBytes.
+// Jobs 0 means DefaultJobs and CallTimeout 0 means DefaultCallTimeout.
 type Options struct {
-	Repo      string
-	Model     string
-	OutputDir string
-	Stdout    io.Writer
-	Stderr    io.Writer
-	Budget    int
-	Runner    Runner
-	Git       GitFunc
-	MkdirAll  func(string, os.FileMode) error
-	WriteFile func(string, []byte, os.FileMode) error
-	Remove    func(string) error
+	Repo        string
+	Model       string
+	OutputDir   string
+	Stdout      io.Writer
+	Stderr      io.Writer
+	Budget      int
+	Jobs        int
+	CallTimeout time.Duration
+	Runner      Runner
+	Git         GitFunc
+	MkdirAll    func(string, os.FileMode) error
+	WriteFile   func(string, []byte, os.FileMode) error
+	Remove      func(string) error
 }
 
 // Run reviews one repository. It writes the findings file and the page only
@@ -95,28 +112,105 @@ func Run(opts Options) error {
 	if opts.Runner == nil {
 		return errors.New("no runner")
 	}
-	var all []lensoutput.TypedFinding
-	for _, p := range prompts {
-		fmt.Fprintln(opts.Stdout, "prompt-begin")
-		_, _ = opts.Stdout.Write(p)
-		if len(p) == 0 || p[len(p)-1] != '\n' {
-			fmt.Fprintln(opts.Stdout)
-		}
-		fmt.Fprintln(opts.Stdout, "prompt-end")
-		text, err := Call(opts.Runner, opts.Model, p)
-		if err != nil {
-			return err
-		}
-		got, skipped, err := Parse(text, files)
-		if err != nil {
-			return err
-		}
-		for _, msg := range skipped {
-			fmt.Fprintln(opts.Stderr, msg)
-		}
-		all = append(all, got...)
+	all, err := review(opts, prompts, files)
+	if err != nil {
+		return err
 	}
 	return writeOutputs(opts, top, commit, modelID, all, files)
+}
+
+// review runs the prompts up to opts.Jobs at a time and returns the accepted
+// findings in prompt order. Each prompt block is printed whole, in prompt
+// order, before its call starts. After the first failure no new call starts,
+// running calls are cancelled, and that failure is returned.
+func review(opts Options, prompts [][]byte, files map[string][]byte) ([]lensoutput.TypedFinding, error) {
+	jobs := opts.Jobs
+	if jobs == 0 {
+		jobs = DefaultJobs
+	}
+	if jobs < 1 {
+		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
+	timeout := opts.CallTimeout
+	if timeout == 0 {
+		timeout = DefaultCallTimeout
+	}
+	if timeout < 0 {
+		return nil, fmt.Errorf("call timeout must be positive, got %s", timeout)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+	)
+	fail := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	n := len(prompts)
+	results := make([][]lensoutput.TypedFinding, n)
+	sem := make(chan struct{}, jobs)
+	for i, p := range prompts {
+		sem <- struct{}{}
+		if ctx.Err() != nil {
+			break
+		}
+		mu.Lock()
+		writePrompt(opts.Stdout, p)
+		mu.Unlock()
+		wg.Add(1)
+		go func(i int, p []byte) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			start := time.Now()
+			callCtx, callCancel := context.WithTimeout(ctx, timeout)
+			defer callCancel()
+			text, err := Call(callCtx, opts.Runner, opts.Model, p)
+			if err != nil {
+				if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+					err = fmt.Errorf("call timed out after %s: %w", timeout, err)
+				}
+				fail(fmt.Errorf("prompt %d/%d: %w", i+1, n, err))
+				return
+			}
+			got, skipped, err := Parse(text, files)
+			if err != nil {
+				fail(fmt.Errorf("prompt %d/%d: %w", i+1, n, err))
+				return
+			}
+			results[i] = got
+			mu.Lock()
+			defer mu.Unlock()
+			for _, msg := range skipped {
+				fmt.Fprintln(opts.Stderr, msg)
+			}
+			fmt.Fprintf(opts.Stderr, "prompt %d/%d done in %ds (%d findings)\n", i+1, n, int(time.Since(start).Round(time.Second)/time.Second), len(got))
+		}(i, p)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	var all []lensoutput.TypedFinding
+	for _, r := range results {
+		all = append(all, r...)
+	}
+	return all, nil
+}
+
+func writePrompt(w io.Writer, p []byte) {
+	fmt.Fprintln(w, "prompt-begin")
+	_, _ = w.Write(p)
+	if len(p) == 0 || p[len(p)-1] != '\n' {
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintln(w, "prompt-end")
 }
 
 func writeLists(w io.Writer, kept []File, dropped []string) {
@@ -240,7 +334,7 @@ func insideRel(rel string) bool {
 
 // CLI is the source-review command. repo defaults to cwd.
 func CLI(args []string, cwd string, stdout, stderr io.Writer) int {
-	model, out, repo, err := parseArgs(args)
+	a, err := parseArgs(args)
 	if err != nil {
 		if errors.Is(err, errHelp) {
 			fmt.Fprintln(stdout, usageText)
@@ -250,16 +344,18 @@ func CLI(args []string, cwd string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, usageText)
 		return 2
 	}
-	if repo == "" {
-		repo = cwd
+	if a.repo == "" {
+		a.repo = cwd
 	}
 	err = Run(Options{
-		Repo:      repo,
-		Model:     model,
-		OutputDir: out,
-		Stdout:    stdout,
-		Stderr:    stderr,
-		Runner:    OSRunner{},
+		Repo:        a.repo,
+		Model:       a.model,
+		OutputDir:   a.out,
+		Stdout:      stdout,
+		Stderr:      stderr,
+		Jobs:        a.jobs,
+		CallTimeout: a.timeout,
+		Runner:      OSRunner{},
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err.Error())
@@ -268,35 +364,60 @@ func CLI(args []string, cwd string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func parseArgs(args []string) (model, out, repo string, err error) {
+type cliArgs struct {
+	model, out, repo string
+	jobs             int
+	timeout          time.Duration
+}
+
+func parseArgs(args []string) (cliArgs, error) {
+	a := cliArgs{jobs: DefaultJobs, timeout: DefaultCallTimeout}
 	for i := 0; i < len(args); i++ {
-		a := args[i]
+		arg := args[i]
 		switch {
-		case a == "--help" || a == "-h":
-			return "", "", "", errHelp
-		case a == "--model":
+		case arg == "--help" || arg == "-h":
+			return cliArgs{}, errHelp
+		case arg == "--model" || arg == "--output" || arg == "--jobs" || arg == "--call-timeout":
 			if i+1 >= len(args) {
-				return "", "", "", errors.New("missing value for --model")
+				return cliArgs{}, fmt.Errorf("missing value for %s", arg)
 			}
 			i++
-			model = args[i]
-		case a == "--output":
-			if i+1 >= len(args) {
-				return "", "", "", errors.New("missing value for --output")
+			if err := a.set(arg, args[i]); err != nil {
+				return cliArgs{}, err
 			}
-			i++
-			out = args[i]
-		case strings.HasPrefix(a, "--"):
-			return "", "", "", fmt.Errorf("unknown option: %s", a)
+		case strings.HasPrefix(arg, "--"):
+			return cliArgs{}, fmt.Errorf("unknown option: %s", arg)
 		default:
-			if repo != "" {
-				return "", "", "", fmt.Errorf("unexpected argument: %s", a)
+			if a.repo != "" {
+				return cliArgs{}, fmt.Errorf("unexpected argument: %s", arg)
 			}
-			repo = a
+			a.repo = arg
 		}
 	}
-	if model == "" || out == "" {
-		return "", "", "", errors.New("missing --model or --output")
+	if a.model == "" || a.out == "" {
+		return cliArgs{}, errors.New("missing --model or --output")
 	}
-	return model, out, repo, nil
+	return a, nil
+}
+
+func (a *cliArgs) set(flag, v string) error {
+	switch flag {
+	case "--model":
+		a.model = v
+	case "--output":
+		a.out = v
+	case "--jobs":
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return fmt.Errorf("--jobs must be an integer of at least 1, got %q", v)
+		}
+		a.jobs = n
+	default:
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("--call-timeout must be a positive duration such as 30m, got %q", v)
+		}
+		a.timeout = d
+	}
+	return nil
 }

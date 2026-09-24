@@ -39,9 +39,13 @@ abbreviated — task-done/epic-ready/pr-ready also take `--evidence <file>` (a v
 | **epic-ready** | `review epic-ready <id>` | the epic's **integration diff** (base..HEAD, the union of the children's changes), **with the roll-up as context** — child evidence present? contradictions? intent drift? registry coverage? | deterministic heuristics (roll-up freshness) **+ a required adjudicated review** over the integration diff (base..HEAD) via the `epic-review-loop` workflow — same require-lenses gate as pr-ready/task-done |
 | **learn** | `learn --post-merge <pr>` | what the merged PR + bot findings teach us | learning extraction |
 
-`source-review` is a separate command (`source-review --model astra|opus|grok --output <dir> [<repo>]`).
+`source-review` is a separate command (`source-review --model astra|opus|grok --output <dir> [--jobs <n>]
+[--call-timeout <duration>] [<repo>]`).
 It reviews the first-party source at HEAD — code `Classify` keeps, minus tests, vendored trees,
-generated files, and non-UTF-8 — by calling the logged-in `claude`, `codex`, or `grok` CLI.
+generated files, and non-UTF-8 — by calling the logged-in `claude`, `codex`, or `grok` CLI, up to `--jobs`
+prompts at once (default 8), each call killed with its process group past `--call-timeout` (default 30m).
+Grok runs as one tool-less turn (`--prompt-file --verbatim --json-schema --tools "" --max-turns 1
+--system-prompt-override`): `grok -p` hands a large prompt to its agent as an excerpt it re-reads with tools.
 It does not use the diff-review anchor gate, `ValidatePayload`, `internal/shardpack`, or `review-lenses`.
 
 `epic-ready` runs *after* every child task is task-done-reviewed. It reviews the epic's **integration diff**

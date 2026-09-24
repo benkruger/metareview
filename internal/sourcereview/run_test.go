@@ -2,12 +2,17 @@ package sourcereview
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/dsifry/metareview/internal/lensoutput"
 )
@@ -55,10 +60,10 @@ func TestRunSpecFixtureThreeModels(t *testing.T) {
 			reply: func(_ int, name string, args []string, stdin []byte) ([]byte, error) {
 				var prompt []byte
 				if model == "grok" {
-					if stdin != nil {
-						t.Fatal("grok prompt must be an argument")
+					if stdin != nil || args[0] != "--prompt-file" {
+						t.Fatal("grok prompt must be a --prompt-file")
 					}
-					prompt = []byte(args[1])
+					prompt, _ = os.ReadFile(args[1])
 				} else {
 					prompt = stdin
 				}
@@ -88,7 +93,7 @@ func TestRunSpecFixtureThreeModels(t *testing.T) {
 			t.Fatal("instruction missing")
 		}
 		for path, body := range specFiles() {
-			needle := append([]byte(path+"\n"), body...)
+			needle := append([]byte(path+"\n"), numberLines(body, 1)...)
 			has := bytes.Contains(p, needle)
 			if path == "pkg/app.go" || path == "pkg/note.go" {
 				if !has {
@@ -204,7 +209,7 @@ func TestRunMergesPromptOrder(t *testing.T) {
 		return cliStdout("opus", text), nil
 	}}
 	outDir := t.TempDir()
-	if err := Run(Options{Repo: root, Model: "opus", OutputDir: outDir, Stdout: &bytes.Buffer{}, Runner: fr}); err != nil {
+	if err := Run(Options{Repo: root, Model: "opus", OutputDir: outDir, Stdout: &bytes.Buffer{}, Jobs: 1, Runner: fr}); err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(filepath.Join(outDir, "findings.json"))
@@ -238,6 +243,172 @@ func TestRunMergesPromptOrder(t *testing.T) {
 	page, _ := os.ReadFile(filepath.Join(outDir, "review.html"))
 	if !bytes.Contains(page, []byte("opus")) || bytes.Count(page, []byte(`class="finding"`)) != len(order) {
 		t.Fatal("page findings")
+	}
+}
+
+// fivePrompts is a repo whose kept files pack into five prompts, one file
+// each, in path order p1.go..p5.go. Each is 100,000 bytes in 1,000 lines, so
+// numbered it still fits one prompt but two never share one.
+func fivePrompts(t *testing.T) (string, []string) {
+	t.Helper()
+	files := map[string][]byte{}
+	var paths []string
+	for i := 1; i <= 5; i++ {
+		p := fmt.Sprintf("p%d.go", i)
+		files[p] = bytes.Repeat(append(bytes.Repeat([]byte("x"), 99), '\n'), 1000)
+		paths = append(paths, p)
+	}
+	root, _ := newRepoBytes(t, files)
+	return root, paths
+}
+
+// promptPath is the one pN.go path a prompt carries.
+func promptPath(prompt []byte, paths []string) (int, string) {
+	for i, p := range paths {
+		if bytes.Contains(prompt, []byte("\n"+p+"\n")) {
+			return i, p
+		}
+	}
+	return -1, ""
+}
+
+func oneFinding(path string) []byte {
+	return cliStdout("opus", `{"findings":[{"tag":"bug","file":"`+path+`","start_line":1,"end_line":1,"issue":"i-`+path+`","consequence":"c","confidence":80,"severity":"P2"}]}`)
+}
+
+func TestRunJobsKeepPromptOrder(t *testing.T) {
+	root, paths := fivePrompts(t)
+	var mu sync.Mutex
+	var finished []string
+	fr := &fakeRunner{}
+	fr.reply = func(_ int, _ string, _ []string, stdin []byte) ([]byte, error) {
+		i, p := promptPath(stdin, paths)
+		// Later prompts answer first: prompt 5 finishes before prompt 1.
+		time.Sleep(time.Duration(len(paths)-i) * 60 * time.Millisecond)
+		mu.Lock()
+		finished = append(finished, p)
+		mu.Unlock()
+		return oneFinding(p), nil
+	}
+	outDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if err := Run(Options{Repo: root, Model: "opus", OutputDir: outDir, Stdout: &stdout, Stderr: &stderr, Jobs: 3, Runner: fr}); err != nil {
+		t.Fatal(err)
+	}
+	if fr.maxActive != 3 {
+		t.Fatalf("max concurrent calls %d, want 3", fr.maxActive)
+	}
+	if finished[0] == paths[0] {
+		t.Fatalf("calls finished in prompt order %v; the test needs reverse", finished)
+	}
+	raw, _ := os.ReadFile(filepath.Join(outDir, "findings.json"))
+	var doc struct {
+		Findings []lensoutput.TypedFinding `json:"findings"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Findings) != len(paths) {
+		t.Fatalf("findings %d", len(doc.Findings))
+	}
+	for i, f := range doc.Findings {
+		if f.File != paths[i] {
+			t.Fatalf("finding %d is %s, want %s (finished %v)", i, f.File, paths[i], finished)
+		}
+	}
+	// Prompt blocks are whole and in prompt order.
+	out := stdout.String()
+	last := -1
+	for _, p := range paths {
+		at := strings.Index(out, "\n"+p+"\n")
+		if at < last {
+			t.Fatalf("prompt for %s printed out of order", p)
+		}
+		last = at
+	}
+	if strings.Count(out, "prompt-begin\n") != len(paths) || strings.Count(out, "prompt-end\n") != len(paths) {
+		t.Fatal("prompt markers")
+	}
+	for _, block := range strings.Split(out, "prompt-begin\n")[1:] {
+		if strings.Count(block, "prompt-end\n") != 1 || !strings.HasSuffix(block, "prompt-end\n") {
+			t.Fatal("a prompt block was interleaved")
+		}
+	}
+	for i := 1; i <= len(paths); i++ {
+		re := regexp.MustCompile(fmt.Sprintf(`(?m)^prompt %d/5 done in \d+s \(1 findings\)$`, i))
+		if n := len(re.FindAllString(stderr.String(), -1)); n != 1 {
+			t.Fatalf("progress line for prompt %d appears %d times:\n%s", i, n, stderr.String())
+		}
+	}
+}
+
+func TestRunCallTimeout(t *testing.T) {
+	root, _ := newRepoBytes(t, specFiles())
+	outDir := t.TempDir()
+	fr := &fakeRunner{wait: func(ctx context.Context, _ []byte) error {
+		<-ctx.Done()
+		return errors.New("signal: killed")
+	}}
+	err := Run(Options{Repo: root, Model: "grok", OutputDir: outDir, Stdout: &bytes.Buffer{}, CallTimeout: 50 * time.Millisecond, Runner: fr})
+	if err == nil || !strings.Contains(err.Error(), "prompt 1/1") || !strings.Contains(err.Error(), "timed out after 50ms") {
+		t.Fatal(err)
+	}
+	if ents, _ := os.ReadDir(outDir); len(ents) != 0 {
+		t.Fatal("wrote after a timeout")
+	}
+}
+
+func TestRunFailureStopsNewCalls(t *testing.T) {
+	root, paths := fivePrompts(t)
+	// One job: the first prompt fails, so no other prompt starts.
+	fr := &fakeRunner{reply: func(int, string, []string, []byte) ([]byte, error) {
+		return nil, errors.New("exit status 1")
+	}}
+	outDir := t.TempDir()
+	err := Run(Options{Repo: root, Model: "opus", OutputDir: outDir, Stdout: &bytes.Buffer{}, Jobs: 1, Runner: fr})
+	if err == nil || !strings.Contains(err.Error(), "prompt 1/5") {
+		t.Fatal(err)
+	}
+	if n := len(fr.callList()); n != 1 {
+		t.Fatalf("calls after the failure: %d", n)
+	}
+	if ents, _ := os.ReadDir(outDir); len(ents) != 0 {
+		t.Fatal("wrote after a failure")
+	}
+	// Two jobs: prompt 1 fails while prompt 2 is running; prompt 2 is
+	// cancelled, nothing else starts, and prompt 1's error is returned.
+	fr = &fakeRunner{}
+	fr.wait = func(ctx context.Context, prompt []byte) error {
+		if i, _ := promptPath(prompt, paths); i == 0 {
+			time.Sleep(50 * time.Millisecond)
+			return errors.New("first failed")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	err = Run(Options{Repo: root, Model: "opus", OutputDir: outDir, Stdout: &bytes.Buffer{}, Jobs: 2, Runner: fr})
+	if err == nil || !strings.Contains(err.Error(), "first failed") {
+		t.Fatal(err)
+	}
+	if n := len(fr.callList()); n != 2 {
+		t.Fatalf("calls %d, want 2", n)
+	}
+	if ents, _ := os.ReadDir(outDir); len(ents) != 0 {
+		t.Fatal("wrote after a failure")
+	}
+}
+
+func TestRunBadJobsAndTimeout(t *testing.T) {
+	root, _ := newRepoBytes(t, specFiles())
+	fr := &fakeRunner{}
+	if err := Run(Options{Repo: root, Model: "opus", OutputDir: t.TempDir(), Jobs: -1, Runner: fr}); err == nil || !strings.Contains(err.Error(), "jobs") {
+		t.Fatal(err)
+	}
+	if err := Run(Options{Repo: root, Model: "opus", OutputDir: t.TempDir(), CallTimeout: -time.Second, Runner: fr}); err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatal(err)
+	}
+	if len(fr.callList()) != 0 {
+		t.Fatal("model called")
 	}
 }
 
@@ -497,7 +668,7 @@ func TestPromptWithoutTrailingNewline(t *testing.T) {
 	if !strings.Contains(buf.String(), "prompt-end\n") {
 		t.Fatalf("prompt marker missing:\n%s", buf.String())
 	}
-	if !bytes.Contains(fr.calls[0].stdin, []byte("nonl.go\npackage nonl")) {
+	if !bytes.Contains(fr.calls[0].stdin, []byte("nonl.go\n1| package nonl")) {
 		t.Fatal("path not immediately before text")
 	}
 }
@@ -519,15 +690,30 @@ func TestCLI(t *testing.T) {
 		{"--output", t.TempDir()},
 		{"--nope"},
 		{"--model", "opus", "--output", t.TempDir(), "extra", "more"},
+		{"--model", "opus", "--output", t.TempDir(), "--jobs"},
+		{"--model", "opus", "--output", t.TempDir(), "--jobs", "0"},
+		{"--model", "opus", "--output", t.TempDir(), "--jobs", "two"},
+		{"--model", "opus", "--output", t.TempDir(), "--call-timeout"},
+		{"--model", "opus", "--output", t.TempDir(), "--call-timeout", "0"},
+		{"--model", "opus", "--output", t.TempDir(), "--call-timeout", "-5m"},
+		{"--model", "opus", "--output", t.TempDir(), "--call-timeout", "soon"},
 	} {
 		code, errOut = cliCapture(t, "", args...)
-		if code != 2 || errOut == "" {
+		if code != 2 || errOut == "" || !strings.Contains(errOut, "Usage:") {
 			t.Fatalf("args %v code=%d err=%q", args, code, errOut)
 		}
 	}
+	a, err := parseArgs([]string{"--model", "grok", "--output", "o"})
+	if err != nil || DefaultJobs != 8 || DefaultCallTimeout != 30*time.Minute || a.jobs != DefaultJobs || a.timeout != DefaultCallTimeout {
+		t.Fatalf("defaults %+v %v", a, err)
+	}
+	a, err = parseArgs([]string{"--model", "grok", "--output", "o", "--jobs", "3", "--call-timeout", "90s", "repo"})
+	if err != nil || a.jobs != 3 || a.timeout != 90*time.Second || a.repo != "repo" {
+		t.Fatalf("flags %+v %v", a, err)
+	}
 	root, commit := newRepoBytes(t, droppedOnlyFiles())
 	outDir := t.TempDir()
-	code, errOut = cliCapture(t, root, "--model", "opus", "--output", outDir)
+	code, errOut = cliCapture(t, root, "--model", "opus", "--output", outDir, "--jobs", "2", "--call-timeout", "1m")
 	if code != 0 || errOut != "" {
 		t.Fatalf("cli code=%d err=%q", code, errOut)
 	}

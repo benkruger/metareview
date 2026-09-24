@@ -2,35 +2,81 @@ package sourcereview
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
+// fakeRunner records calls. It is safe for concurrent calls: n is the call's
+// start order, active/maxActive count calls running at the same time, and wait
+// (when set) runs inside the call before reply so a test can block on ctx.
 type fakeRunner struct {
-	calls []fakeCall
-	reply func(n int, name string, args []string, stdin []byte) ([]byte, error)
-	onRun func()
+	mu        sync.Mutex
+	calls     []fakeCall
+	active    int
+	maxActive int
+	reply     func(n int, name string, args []string, stdin []byte) ([]byte, error)
+	wait      func(ctx context.Context, prompt []byte) error
+	onRun     func()
 }
 
 type fakeCall struct {
 	name  string
 	args  []string
 	stdin []byte
+	// prompt is the prompt the CLI received: stdin, or the --prompt-file bytes.
+	prompt []byte
 }
 
-func (f *fakeRunner) Run(name string, args []string, stdin []byte) ([]byte, error) {
+func (f *fakeRunner) Run(ctx context.Context, name string, args []string, stdin []byte) ([]byte, error) {
 	if f.onRun != nil {
 		f.onRun()
 	}
-	f.calls = append(f.calls, fakeCall{name, append([]string(nil), args...), append([]byte(nil), stdin...)})
+	prompt := append([]byte(nil), stdin...)
+	for i, a := range args {
+		if a == "--prompt-file" && i+1 < len(args) {
+			prompt, _ = os.ReadFile(args[i+1])
+		}
+	}
+	f.mu.Lock()
+	n := len(f.calls)
+	f.calls = append(f.calls, fakeCall{name, append([]string(nil), args...), append([]byte(nil), stdin...), prompt})
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.active--
+		f.mu.Unlock()
+	}()
+	if f.wait != nil {
+		if err := f.wait(ctx, prompt); err != nil {
+			return nil, err
+		}
+	}
 	if f.reply == nil {
 		return nil, errors.New("no reply")
 	}
-	return f.reply(len(f.calls)-1, name, args, stdin)
+	return f.reply(n, name, args, stdin)
 }
+
+func (f *fakeRunner) callList() []fakeCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeCall(nil), f.calls...)
+}
+
+var bg = context.Background()
 
 func TestModelID(t *testing.T) {
 	cases := map[string]string{"opus": "opus", " astra ": "gpt-6-astra", "GROK": "grok-4.7"}
@@ -58,7 +104,7 @@ func TestCallShapes(t *testing.T) {
 				return []byte(`{"text":"{\"findings\":[]}"}`), nil
 			}
 		}}
-		text, err := Call(fr, model, prompt)
+		text, err := Call(bg, fr, model, prompt)
 		if err != nil {
 			t.Fatal(model, err)
 		}
@@ -80,10 +126,135 @@ func TestCallShapes(t *testing.T) {
 				t.Fatalf("codex call %+v", c)
 			}
 		case "grok":
-			if c.name != "grok" || !reflectArgs(c.args, []string{"-p", string(prompt), "-m", "grok-4.7", "--output-format", "json"}) || c.stdin != nil {
+			if c.name != "grok" || len(c.args) < 2 || !reflectArgs(c.args, grokWant(c.args[1])) || c.stdin != nil || !bytes.Equal(c.prompt, prompt) {
 				t.Fatalf("grok call %+v", c)
 			}
 		}
+	}
+}
+
+// grokWant is the exact Grok argv the goal names, for a given prompt file.
+func grokWant(promptFile string) []string {
+	return []string{
+		"--prompt-file", promptFile, "--verbatim",
+		"-m", "grok-4.7", "--output-format", "json",
+		"--json-schema", grokSchema,
+		"--tools", "", "--max-turns", "1", "--no-subagents", "--disable-web-search",
+		"--system-prompt-override", "You are a code reviewer. You have no tools. Everything you need is in the user message. Answer in a single message.",
+	}
+}
+
+func TestGrokPromptFile(t *testing.T) {
+	prompt := []byte("review this ✓\n")
+	tree, out := t.TempDir(), t.TempDir()
+	replies := map[string]func() ([]byte, error){
+		"success":      func() ([]byte, error) { return []byte(`{"text":"{\"findings\":[]}"}`), nil },
+		"nonzero":      func() ([]byte, error) { return nil, errors.New("grok: exit status 1") },
+		"cannot-start": func() ([]byte, error) { return nil, errors.New(`exec: "grok": executable file not found in $PATH`) },
+	}
+	for name, reply := range replies {
+		var path string
+		fr := &fakeRunner{reply: func(_ int, _ string, args []string, _ []byte) ([]byte, error) {
+			path = args[1]
+			got, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(got, prompt) {
+				t.Fatalf("%s: prompt file during the call: %v %q", name, err, got)
+			}
+			for _, dir := range []string{tree, out} {
+				if strings.HasPrefix(path, dir) {
+					t.Fatalf("%s: prompt file %s inside %s", name, path, dir)
+				}
+			}
+			if filepath.Dir(path) != filepath.Clean(os.TempDir()) {
+				t.Fatalf("%s: prompt file %s not in os.TempDir()", name, path)
+			}
+			return reply()
+		}}
+		_, err := Call(bg, fr, "grok", prompt)
+		if (name == "success") != (err == nil) {
+			t.Fatalf("%s: err %v", name, err)
+		}
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("%s: prompt file %s left behind", name, path)
+		}
+	}
+	// A real process that cannot start also removes the file.
+	before, _ := filepath.Glob(filepath.Join(os.TempDir(), "metareview-grok-prompt-*"))
+	t.Setenv("PATH", t.TempDir())
+	if _, err := Call(bg, OSRunner{}, "grok", prompt); err == nil {
+		t.Fatal("grok should not start with an empty PATH")
+	}
+	after, _ := filepath.Glob(filepath.Join(os.TempDir(), "metareview-grok-prompt-*"))
+	if len(after) > len(before) {
+		t.Fatalf("prompt file left behind: %v", after)
+	}
+}
+
+func TestGrokSchema(t *testing.T) {
+	var s struct {
+		Type       string `json:"type"`
+		Required   []string
+		Properties struct {
+			Findings struct {
+				Type  string `json:"type"`
+				Items struct {
+					Required   []string                   `json:"required"`
+					Properties map[string]json.RawMessage `json:"properties"`
+				} `json:"items"`
+			} `json:"findings"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(grokSchema), &s); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"tag", "file", "start_line", "end_line", "issue", "consequence", "confidence", "severity"}
+	if !reflectArgs(s.Properties.Findings.Items.Required, want) || s.Properties.Findings.Type != "array" {
+		t.Fatalf("schema required %v", s.Properties.Findings.Items.Required)
+	}
+	for _, f := range want {
+		if _, ok := s.Properties.Findings.Items.Properties[f]; !ok {
+			t.Fatalf("schema has no property %s", f)
+		}
+	}
+	for f, typ := range map[string]string{"start_line": "integer", "end_line": "integer", "confidence": "integer"} {
+		if !strings.Contains(string(s.Properties.Findings.Items.Properties[f]), `"`+typ+`"`) {
+			t.Fatalf("%s is not %s", f, typ)
+		}
+	}
+	for f, enum := range map[string]string{"tag": `["bug","advisory"]`, "severity": `["P0","P1","P2","P3"]`} {
+		if !strings.Contains(string(s.Properties.Findings.Items.Properties[f]), enum) {
+			t.Fatalf("%s enum", f)
+		}
+	}
+}
+
+func TestWritePromptFileErrors(t *testing.T) {
+	prevCreate, prevRemove := createTemp, removeFile
+	t.Cleanup(func() { createTemp, removeFile = prevCreate, prevRemove })
+	createTemp = func(string, string) (*os.File, error) { return nil, errors.New("create") }
+	if _, err := Call(bg, &fakeRunner{}, "grok", []byte("p")); err == nil || !strings.Contains(err.Error(), "create") {
+		t.Fatal(err)
+	}
+	// A file that is already closed fails Write; the partial file is removed.
+	var made string
+	createTemp = func(dir, pattern string) (*os.File, error) {
+		f, err := prevCreate(dir, pattern)
+		if err != nil {
+			return nil, err
+		}
+		made = f.Name()
+		_ = f.Close()
+		return f, nil
+	}
+	fr := &fakeRunner{}
+	if _, err := Call(bg, fr, "grok", []byte("p")); err == nil {
+		t.Fatal("write to a closed file")
+	}
+	if len(fr.callList()) != 0 {
+		t.Fatal("grok ran without a prompt file")
+	}
+	if _, err := os.Stat(made); !os.IsNotExist(err) {
+		t.Fatal("partial prompt file left behind")
 	}
 }
 
@@ -103,101 +274,130 @@ func TestCallErrors(t *testing.T) {
 	fr := &fakeRunner{reply: func(int, string, []string, []byte) ([]byte, error) {
 		return nil, errors.New("executable file not found")
 	}}
-	if _, err := Call(fr, "opus", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "opus", []byte("p")); err == nil {
 		t.Fatal("start failure")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte(`{"is_error":true,"result":"boom"}`), nil
 	}
-	if _, err := Call(fr, "opus", []byte("p")); err == nil || !strings.Contains(err.Error(), "is_error") {
+	if _, err := Call(bg, fr, "opus", []byte("p")); err == nil || !strings.Contains(err.Error(), "is_error") {
 		t.Fatal(err)
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte(`{"is_error":false}`), nil
 	}
-	if _, err := Call(fr, "opus", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "opus", []byte("p")); err == nil {
 		t.Fatal("missing result")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte(`{"is_error":false,"result":""}`), nil
 	}
-	if _, err := Call(fr, "opus", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "opus", []byte("p")); err == nil {
 		t.Fatal("empty result")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte("not-json"), nil
 	}
-	if _, err := Call(fr, "opus", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "opus", []byte("p")); err == nil {
 		t.Fatal("bad claude json")
 	}
-	if _, err := Call(fr, "grok", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "grok", []byte("p")); err == nil {
 		t.Fatal("bad grok json")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte(`{"text":""}`), nil
 	}
-	if _, err := Call(fr, "grok", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "grok", []byte("p")); err == nil {
 		t.Fatal("empty grok text")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte(`{}`), nil
 	}
-	if _, err := Call(fr, "grok", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "grok", []byte("p")); err == nil {
 		t.Fatal("nil grok text")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"\"}}\n"), nil
 	}
-	if _, err := Call(fr, "astra", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "astra", []byte("p")); err == nil {
 		t.Fatal("empty codex text")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return []byte("nope\n"), nil
 	}
-	if _, err := Call(fr, "astra", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "astra", []byte("p")); err == nil {
 		t.Fatal("no agent message")
 	}
-	if _, err := Call(fr, "nope", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "nope", []byte("p")); err == nil {
 		t.Fatal("unknown model")
 	}
 	fr.reply = func(int, string, []string, []byte) ([]byte, error) {
 		return nil, errors.New("exit status 1")
 	}
-	if _, err := Call(fr, "astra", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "astra", []byte("p")); err == nil {
 		t.Fatal("nonzero")
 	}
-	if _, err := Call(fr, "grok", []byte("p")); err == nil {
+	if _, err := Call(bg, fr, "grok", []byte("p")); err == nil {
 		t.Fatal("grok nonzero")
 	}
 }
 
 func TestOSRunner(t *testing.T) {
-	out, err := OSRunner{}.Run("echo", []string{"hi"}, nil)
+	out, err := OSRunner{}.Run(bg, "echo", []string{"hi"}, nil)
 	if err != nil || !bytes.Contains(out, []byte("hi")) {
 		t.Fatalf("echo: %v %q", err, out)
 	}
-	out, err = OSRunner{}.Run("cat", nil, []byte("yo"))
+	out, err = OSRunner{}.Run(bg, "cat", nil, []byte("yo"))
 	if err != nil || !bytes.Equal(out, []byte("yo")) {
 		t.Fatalf("cat: %v %q", err, out)
 	}
-	if _, err := (OSRunner{}).Run("false", nil, nil); err == nil {
+	if _, err := (OSRunner{}).Run(bg, "false", nil, nil); err == nil {
 		t.Fatal("false should fail")
 	}
-	if _, err := (OSRunner{}).Run("sh", []string{"-c", "echo boom >&2; exit 1"}, nil); err == nil || !strings.Contains(err.Error(), "boom") {
+	if _, err := (OSRunner{}).Run(bg, "sh", []string{"-c", "echo boom >&2; exit 1"}, nil); err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatal(err)
 	}
-	if _, err := (OSRunner{}).Run("sh", []string{"-c", "echo usage-limit; exit 1"}, nil); err == nil || !strings.Contains(err.Error(), "usage-limit") {
+	if _, err := (OSRunner{}).Run(bg, "sh", []string{"-c", "echo usage-limit; exit 1"}, nil); err == nil || !strings.Contains(err.Error(), "usage-limit") {
 		t.Fatal(err)
 	}
-	if _, err := (OSRunner{}).Run("sh", []string{"-c", "echo out-line; echo err-line >&2; exit 1"}, nil); err == nil || !strings.Contains(err.Error(), "err-line") || !strings.Contains(err.Error(), "out-line") {
+	if _, err := (OSRunner{}).Run(bg, "sh", []string{"-c", "echo out-line; echo err-line >&2; exit 1"}, nil); err == nil || !strings.Contains(err.Error(), "err-line") || !strings.Contains(err.Error(), "out-line") {
 		t.Fatal(err)
 	}
-	if _, err := (OSRunner{}).Run("no-such-binary-xyz", nil, nil); err == nil {
+	if _, err := (OSRunner{}).Run(bg, "no-such-binary-xyz", nil, nil); err == nil {
 		t.Fatal("missing binary")
 	}
 	// exec.Command is used; a lookup failure is *exec.Error, not ExitError.
 	if _, err := exec.LookPath("echo"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOSRunnerKillsProcessGroup(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	ctx, cancel := context.WithTimeout(bg, 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := OSRunner{}.Run(ctx, "sh", []string{"-c", `sleep 30 & echo $! > "$0"; wait`, pidFile}, nil)
+	if err == nil {
+		t.Fatal("expected a killed process")
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Fatalf("kill took %s", took)
+	}
+	raw, rerr := os.ReadFile(pidFile)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	pid, perr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for exec.Command("kill", "-0", strconv.Itoa(pid)).Run() == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("child %d still running", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

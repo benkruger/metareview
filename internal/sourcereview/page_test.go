@@ -59,8 +59,102 @@ func TestRenderFiltersAndQuote(t *testing.T) {
 	if dir.Displays[0] != "" || dir.Displays[1] != "none" {
 		t.Fatalf("directory filter displays %v", dir.Displays)
 	}
-	if report.Opened.Hidden || report.Opened.Issue != "root broke" || report.Opened.Consequence != "no entry" || report.Opened.Quote != "package main" {
+	if report.Opened.Hidden || report.Opened.Expanded != "true" || report.Opened.Issue != "root broke" || report.Opened.Consequence != "no entry" || report.Opened.Quote != "package main" {
 		t.Fatalf("opened %+v", report.Opened)
+	}
+	if !report.Closed.Hidden || report.Closed.Expanded != "false" {
+		t.Fatalf("closed %+v", report.Closed)
+	}
+	all := []string{"", "", "", ""}
+	if report.Bar.Severity != "P0" || !reflectArgs(report.Bar.Displays, []string{"", "none", "none", "none"}) || report.Bar.Pressed != "true" || report.Bar.Shown != "Showing 1 of 4" {
+		t.Fatalf("bar %+v", report.Bar)
+	}
+	if report.BarCleared.Severity != "" || !reflectArgs(report.BarCleared.Displays, all) || report.BarCleared.Shown != "Showing all 4" {
+		t.Fatalf("bar cleared %+v", report.BarCleared)
+	}
+	// The biggest area is the repo root: main.go and a.go.
+	if report.Area.Name != "." || !reflectArgs(report.Area.Displays, []string{"", "none", "", "none"}) || !reflectArgs(report.Area.Groups, []string{"", "none", "", "none"}) || report.Area.Pressed != "true" {
+		t.Fatalf("area %+v", report.Area)
+	}
+	if !reflectArgs(report.AreaCleared.Displays, all) || report.AreaCleared.Pressed != "false" {
+		t.Fatalf("area cleared %+v", report.AreaCleared)
+	}
+	if !reflectArgs(report.Search.Displays, []string{"none", "", "none", "none"}) || report.Search.Shown != "Showing 1 of 4" {
+		t.Fatalf("search %+v", report.Search)
+	}
+}
+
+func TestPageHelpers(t *testing.T) {
+	for n, want := range map[int]string{0: "0", 7: "7", 999: "999", 1000: "1,000", 1346: "1,346", 1234567: "1,234,567"} {
+		if got := thousands(n); got != want {
+			t.Fatalf("thousands(%d) = %q", n, got)
+		}
+	}
+	if plural(1, "file", "files") != "1 file" || plural(1346, "file", "files") != "1,346 files" {
+		t.Fatal("plural")
+	}
+	for _, c := range []struct {
+		counts []int
+		want   string
+	}{
+		{[]int{0, 0, 0, 0}, "Reviewed 3 files with opus and found nothing to report."},
+		{[]int{0, 37, 136, 123}, "Reviewed 3 files with opus. Start with the 37 at P1."},
+		{[]int{0, 0, 1, 0}, "Reviewed 3 files with opus. The one finding is a P2."},
+		{[]int{0, 0, 0, 2}, "Reviewed 3 files with opus. All 2 findings are P3."},
+	} {
+		if got := lede("opus", 3, c.counts); got != c.want {
+			t.Fatalf("lede %v = %q", c.counts, got)
+		}
+	}
+	if summary(" One. Two. ") != "One." || summary("No period") != "No period" || summary("v1.2 is out") != "v1.2 is out" {
+		t.Fatal("summary")
+	}
+	if area("main.go") != "." || area("app/x.rb") != "app" || area("app/models/concerns/x.rb") != "app/models" {
+		t.Fatal("area")
+	}
+	if severityRank("P0") != 0 || severityRank("P3") != 3 || severityRank("bogus") != 4 {
+		t.Fatal("severityRank")
+	}
+	f := func(file, sev string, line int) lensoutput.TypedFinding {
+		return lensoutput.TypedFinding{File: file, Severity: sev, StartLine: line, EndLine: line}
+	}
+	groups := groupByFile([]lensoutput.TypedFinding{
+		f("z.go", "P2", 9), f("z.go", "P2", 3), f("z.go", "P1", 5),
+		f("b.go", "P1", 1),
+		f("a.go", "P1", 1),
+		f("c.go", "P3", 1),
+	})
+	var order []string
+	for _, g := range groups {
+		order = append(order, g.file)
+	}
+	// Worst severity first; among equals, more findings first; then by path.
+	if !reflectArgs(order, []string{"z.go", "a.go", "b.go", "c.go"}) {
+		t.Fatalf("group order %v", order)
+	}
+	z := groups[0].findings
+	if z[0].StartLine != 5 || z[1].StartLine != 3 || z[2].StartLine != 9 {
+		t.Fatalf("findings in z.go %+v", z)
+	}
+	rows := areaRows([]lensoutput.TypedFinding{f("b/x.go", "P3", 1), f("a/x.go", "P3", 1), f("c/x.go", "P2", 1), f("c/y.go", "P1", 1)})
+	if rows[0].name != "c" || !reflectArgs(rows[0].severities, []string{"P1", "P2"}) || rows[1].name != "a" || rows[2].name != "b" {
+		t.Fatalf("area rows %+v", rows)
+	}
+}
+
+func TestRenderRangesAndGutter(t *testing.T) {
+	files := map[string][]byte{"pkg/app.go": []byte("alpha\nbeta\ngamma\n")}
+	page := string(Render(Page{Repo: "/src/app", Commit: "c", ModelID: "grok-4.7", Files: files, Findings: []lensoutput.TypedFinding{
+		{Tag: lensoutput.TagBug, File: "pkg/app.go", StartLine: 2, EndLine: 3, Issue: "First sentence. Second sentence.", Consequence: "bad", Confidence: 80, Severity: "P2"},
+	}}))
+	for _, want := range []string{
+		"<h1>app</h1>", "L2–3", `<pre class="gutter" aria-hidden="true">2` + "\n3</pre>", `<pre class="quote">beta` + "\ngamma</pre>",
+		`<span class="lead">First sentence.</span><span class="rest"> Second sentence.</span>`,
+		`<span class="dir">pkg/</span>app.go`, "Model confidence 80 of 100", "The one finding is a P2.", `data-area="pkg"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("page missing %q", want)
+		}
 	}
 }
 
@@ -77,6 +171,9 @@ func TestRenderEmpty(t *testing.T) {
 	}
 	if !strings.Contains(html, `id="severity"`) || !strings.Contains(html, `id="directory"`) {
 		t.Fatal("filters missing")
+	}
+	if !strings.Contains(html, "No findings. gpt-6-astra reviewed 0 files and reported nothing to fix.") || strings.Contains(html, `id="map"`) || strings.Contains(html, `class="seg`) {
+		t.Fatal("empty page should explain itself and draw no map or bar segments")
 	}
 	report := runPage(t, page)
 	if report.FindingCount != 0 {
@@ -97,10 +194,40 @@ type pageReport struct {
 	} `json:"steps"`
 	Opened struct {
 		Hidden      bool   `json:"hidden"`
+		Expanded    string `json:"expanded"`
 		Issue       string `json:"issue"`
 		Consequence string `json:"consequence"`
 		Quote       string `json:"quote"`
 	} `json:"opened"`
+	Closed struct {
+		Hidden   bool   `json:"hidden"`
+		Expanded string `json:"expanded"`
+	} `json:"closed"`
+	Bar struct {
+		Severity string   `json:"severity"`
+		Displays []string `json:"displays"`
+		Pressed  string   `json:"pressed"`
+		Shown    string   `json:"shown"`
+	} `json:"bar"`
+	BarCleared struct {
+		Severity string   `json:"severity"`
+		Displays []string `json:"displays"`
+		Shown    string   `json:"shown"`
+	} `json:"barCleared"`
+	Area struct {
+		Name     string   `json:"name"`
+		Displays []string `json:"displays"`
+		Groups   []string `json:"groups"`
+		Pressed  string   `json:"pressed"`
+	} `json:"area"`
+	AreaCleared struct {
+		Displays []string `json:"displays"`
+		Pressed  string   `json:"pressed"`
+	} `json:"areaCleared"`
+	Search struct {
+		Displays []string `json:"displays"`
+		Shown    string   `json:"shown"`
+	} `json:"search"`
 }
 
 func runPage(t *testing.T, page []byte) pageReport {
@@ -155,9 +282,11 @@ class El {
     this._listeners = {};
   }
   getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; }
+  setAttribute(k, v) { this.attrs[k] = String(v); }
   addEventListener(type, fn) { (this._listeners[type] ||= []).push(fn); }
   dispatchEvent(type) { for (const fn of this._listeners[type] || []) fn.call(this); }
   get textContent() { return this.children.map(c => c.textContent || "").join(""); }
+  set textContent(v) { this.children = [{ textContent: String(v), name: "" }]; }
   querySelector(sel) { const a = queryAll(this, sel); return a[0] || null; }
   querySelectorAll(sel) { return queryAll(this, sel); }
 }
@@ -247,15 +376,40 @@ if (findings.length >= 2) {
   dir.value = findings[0].getAttribute("data-dir");
   dir.dispatchEvent("change");
   report.steps.push({ displays: findings.map(f => f.style.display) });
+  dir.value = "";
+  dir.dispatchEvent("change");
   const btn = findings[0].querySelector("button");
   btn.dispatchEvent("click");
   const detail = findings[0].querySelector(".detail");
   report.opened = {
     hidden: detail.hidden,
+    expanded: btn.getAttribute("aria-expanded"),
     issue: findings[0].querySelector(".issue").textContent.trim(),
     consequence: findings[0].querySelector(".consequence").textContent.trim(),
     quote: findings[0].querySelector(".quote").textContent.trim(),
   };
+  btn.dispatchEvent("click");
+  report.closed = { hidden: detail.hidden, expanded: btn.getAttribute("aria-expanded") };
+  const displays = () => findings.map(f => f.style.display);
+  const groupDisplays = () => document.querySelectorAll("#findings .group").map(g => g.style.display);
+  const shown = () => document.getElementById("shown").textContent;
+  // The severity bar: one click selects that severity, a second click clears it.
+  const seg = document.querySelectorAll("#bar .seg")[0];
+  seg.dispatchEvent("click");
+  report.bar = { severity: sev.value, displays: displays(), pressed: seg.getAttribute("aria-pressed"), shown: shown() };
+  seg.dispatchEvent("click");
+  report.barCleared = { severity: sev.value, displays: displays(), shown: shown() };
+  // The map: one click shows only that area and hides the other files' groups.
+  const areaBtn = document.querySelectorAll("#map .area")[0];
+  areaBtn.dispatchEvent("click");
+  report.area = { name: areaBtn.getAttribute("data-area"), displays: displays(), groups: groupDisplays(), pressed: areaBtn.getAttribute("aria-pressed") };
+  areaBtn.dispatchEvent("click");
+  report.areaCleared = { displays: displays(), pressed: areaBtn.getAttribute("aria-pressed") };
+  // Search matches the finding's text, case-insensitively.
+  const search = document.getElementById("search");
+  search.value = findings[1].querySelector(".issue").textContent.trim().toUpperCase();
+  search.dispatchEvent("input");
+  report.search = { displays: displays(), shown: shown() };
 }
 process.stdout.write(JSON.stringify(report));
 `
