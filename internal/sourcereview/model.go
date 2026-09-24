@@ -73,13 +73,38 @@ func ModelID(model string) (string, error) {
 	}
 }
 
-// grokSchema constrains Grok's answer to {"findings":[...]} with all eight
-// fields present.
-const grokSchema = `{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"tag":{"type":"string","enum":["bug","advisory"]},"file":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"issue":{"type":"string"},"consequence":{"type":"string"},"confidence":{"type":"integer"},"severity":{"type":"string","enum":["P0","P1","P2","P3"]}},"required":["tag","file","start_line","end_line","issue","consequence","confidence","severity"]}}},"required":["findings"]}`
+// Every model gets the same review setup: this system prompt, this answer
+// schema, no tools, one answer. The prompt text and the parser are shared too,
+// so the models are compared on the same job.
 
-// grokSystem replaces Grok's agent system prompt. Without it the model tries
-// to call tools, and --max-turns 1 cancels the turn.
-const grokSystem = "You are a code reviewer. You have no tools. Everything you need is in the user message. Answer in a single message."
+// findingsSchema constrains the answer to {"findings":[...]} with all eight
+// fields present and no others. Codex's strict schema mode rejects an object
+// without "additionalProperties": false.
+const findingsSchema = `{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"tag":{"type":"string","enum":["bug","advisory"]},"file":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"issue":{"type":"string"},"consequence":{"type":"string"},"confidence":{"type":"integer"},"severity":{"type":"string","enum":["P0","P1","P2","P3"]}},"required":["tag","file","start_line","end_line","issue","consequence","confidence","severity"],"additionalProperties":false}}},"required":["findings"],"additionalProperties":false}`
+
+// reviewSystem replaces each CLI's agent system prompt. Without it Grok tries
+// to call tools and --max-turns 1 cancels the turn.
+const reviewSystem = "You are a code reviewer. You have no tools. Everything you need is in the user message. Answer in a single message."
+
+// claudeArgs runs Claude as one turn with no tools, no MCP servers, and no
+// saved session. The prompt is on stdin.
+func claudeArgs() []string {
+	return []string{
+		"-p", "--model", "opus", "--output-format", "json",
+		"--tools", "", "--system-prompt", reviewSystem, "--json-schema", findingsSchema,
+		"--strict-mcp-config", "--no-session-persistence",
+	}
+}
+
+// codexArgs runs Codex with the shared schema, a read-only sandbox, and no
+// saved session. The prompt is on stdin ("-"). Codex has no switch to remove
+// its tools or replace its system prompt, so it is the one model that differs.
+func codexArgs(schemaFile string) []string {
+	return []string{
+		"exec", "--json", "-m", "gpt-6-astra",
+		"-s", "read-only", "--ephemeral", "--output-schema", schemaFile, "-",
+	}
+}
 
 // grokArgs runs Grok as one turn with no tools. -p hands a large prompt to
 // Grok's agent as an excerpt plus a file to read back with tools, which made
@@ -88,9 +113,9 @@ func grokArgs(promptFile string) []string {
 	return []string{
 		"--prompt-file", promptFile, "--verbatim",
 		"-m", "grok-4.7", "--output-format", "json",
-		"--json-schema", grokSchema,
+		"--json-schema", findingsSchema,
 		"--tools", "", "--max-turns", "1", "--no-subagents", "--disable-web-search",
-		"--system-prompt-override", grokSystem,
+		"--system-prompt-override", reviewSystem,
 	}
 }
 
@@ -101,14 +126,14 @@ var (
 	removeFile = os.Remove
 )
 
-// writePromptFile writes the prompt to a new file in os.TempDir(), which is
-// never inside the reviewed tree or the output directory.
-func writePromptFile(prompt []byte) (string, error) {
-	f, err := createTemp("", "metareview-grok-prompt-*.txt")
+// writeTempFile writes data to a new file in os.TempDir(), which is never
+// inside the reviewed tree or the output directory.
+func writeTempFile(pattern string, data []byte) (string, error) {
+	f, err := createTemp("", pattern)
 	if err != nil {
 		return "", err
 	}
-	_, werr := f.Write(prompt)
+	_, werr := f.Write(data)
 	cerr := f.Close()
 	if err := errors.Join(werr, cerr); err != nil {
 		_ = removeFile(f.Name())
@@ -122,19 +147,24 @@ func writePromptFile(prompt []byte) (string, error) {
 func Call(ctx context.Context, runner Runner, model string, prompt []byte) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(model)) {
 	case "opus":
-		out, err := runner.Run(ctx, "claude", []string{"-p", "--model", "opus", "--output-format", "json"}, prompt)
+		out, err := runner.Run(ctx, "claude", claudeArgs(), prompt)
 		if err != nil {
 			return "", err
 		}
 		return claudeModelText(out)
 	case "astra":
-		out, err := runner.Run(ctx, "codex", []string{"exec", "--json", "-m", "gpt-6-astra", "-"}, prompt)
+		schema, err := writeTempFile("metareview-schema-*.json", []byte(findingsSchema))
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = removeFile(schema) }()
+		out, err := runner.Run(ctx, "codex", codexArgs(schema), prompt)
 		if err != nil {
 			return "", err
 		}
 		return codexModelText(out)
 	case "grok":
-		path, err := writePromptFile(prompt)
+		path, err := writeTempFile("metareview-grok-prompt-*.txt", prompt)
 		if err != nil {
 			return "", err
 		}

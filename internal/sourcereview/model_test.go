@@ -94,11 +94,17 @@ func TestModelID(t *testing.T) {
 func TestCallShapes(t *testing.T) {
 	prompt := []byte("review this")
 	for _, model := range []string{"opus", "astra", "grok"} {
-		fr := &fakeRunner{reply: func(int, string, []string, []byte) ([]byte, error) {
+		var schemaFile string
+		fr := &fakeRunner{reply: func(_ int, _ string, args []string, _ []byte) ([]byte, error) {
 			switch model {
 			case "opus":
 				return []byte(`{"is_error":false,"result":"{\"findings\":[]}"}`), nil
 			case "astra":
+				// The schema file holds the shared schema during the call.
+				schemaFile = args[len(args)-2]
+				if got, err := os.ReadFile(schemaFile); err != nil || string(got) != findingsSchema {
+					t.Fatalf("codex schema file %s: %v %q", schemaFile, err, got)
+				}
 				return []byte("not json\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"findings\\\":[]}\"}}\n"), nil
 			default:
 				return []byte(`{"text":"{\"findings\":[]}"}`), nil
@@ -118,12 +124,20 @@ func TestCallShapes(t *testing.T) {
 		c := fr.calls[0]
 		switch model {
 		case "opus":
-			if c.name != "claude" || !reflectArgs(c.args, []string{"-p", "--model", "opus", "--output-format", "json"}) || !bytes.Equal(c.stdin, prompt) {
+			want := []string{"-p", "--model", "opus", "--output-format", "json", "--tools", "", "--system-prompt", sharedSystem, "--json-schema", findingsSchema, "--strict-mcp-config", "--no-session-persistence"}
+			if c.name != "claude" || !reflectArgs(c.args, want) || !bytes.Equal(c.stdin, prompt) {
 				t.Fatalf("claude call %+v", c)
 			}
 		case "astra":
-			if c.name != "codex" || !reflectArgs(c.args, []string{"exec", "--json", "-m", "gpt-6-astra", "-"}) || !bytes.Equal(c.stdin, prompt) {
+			want := []string{"exec", "--json", "-m", "gpt-6-astra", "-s", "read-only", "--ephemeral", "--output-schema", schemaFile, "-"}
+			if c.name != "codex" || !reflectArgs(c.args, want) || !bytes.Equal(c.stdin, prompt) {
 				t.Fatalf("codex call %+v", c)
+			}
+			if filepath.Dir(schemaFile) != filepath.Clean(os.TempDir()) {
+				t.Fatalf("schema file %s not in os.TempDir()", schemaFile)
+			}
+			if _, err := os.Stat(schemaFile); !os.IsNotExist(err) {
+				t.Fatalf("schema file %s left behind", schemaFile)
 			}
 		case "grok":
 			if c.name != "grok" || len(c.args) < 2 || !reflectArgs(c.args, grokWant(c.args[1])) || c.stdin != nil || !bytes.Equal(c.prompt, prompt) {
@@ -133,14 +147,18 @@ func TestCallShapes(t *testing.T) {
 	}
 }
 
+// sharedSystem is the system prompt every model gets, spelled out so a change
+// to reviewSystem is a visible test change.
+const sharedSystem = "You are a code reviewer. You have no tools. Everything you need is in the user message. Answer in a single message."
+
 // grokWant is the exact Grok argv the goal names, for a given prompt file.
 func grokWant(promptFile string) []string {
 	return []string{
 		"--prompt-file", promptFile, "--verbatim",
 		"-m", "grok-4.7", "--output-format", "json",
-		"--json-schema", grokSchema,
+		"--json-schema", findingsSchema,
 		"--tools", "", "--max-turns", "1", "--no-subagents", "--disable-web-search",
-		"--system-prompt-override", "You are a code reviewer. You have no tools. Everything you need is in the user message. Answer in a single message.",
+		"--system-prompt-override", sharedSystem,
 	}
 }
 
@@ -190,22 +208,28 @@ func TestGrokPromptFile(t *testing.T) {
 	}
 }
 
-func TestGrokSchema(t *testing.T) {
+func TestFindingsSchema(t *testing.T) {
 	var s struct {
-		Type       string `json:"type"`
-		Required   []string
-		Properties struct {
+		Type                 string `json:"type"`
+		Required             []string
+		AdditionalProperties *bool `json:"additionalProperties"`
+		Properties           struct {
 			Findings struct {
 				Type  string `json:"type"`
 				Items struct {
-					Required   []string                   `json:"required"`
-					Properties map[string]json.RawMessage `json:"properties"`
+					Required             []string                   `json:"required"`
+					AdditionalProperties *bool                      `json:"additionalProperties"`
+					Properties           map[string]json.RawMessage `json:"properties"`
 				} `json:"items"`
 			} `json:"findings"`
 		} `json:"properties"`
 	}
-	if err := json.Unmarshal([]byte(grokSchema), &s); err != nil {
+	if err := json.Unmarshal([]byte(findingsSchema), &s); err != nil {
 		t.Fatal(err)
+	}
+	// Codex's strict mode rejects any object that allows extra properties.
+	if s.AdditionalProperties == nil || *s.AdditionalProperties || s.Properties.Findings.Items.AdditionalProperties == nil || *s.Properties.Findings.Items.AdditionalProperties {
+		t.Fatal("every object must set additionalProperties to false")
 	}
 	want := []string{"tag", "file", "start_line", "end_line", "issue", "consequence", "confidence", "severity"}
 	if !reflectArgs(s.Properties.Findings.Items.Required, want) || s.Properties.Findings.Type != "array" {
@@ -232,8 +256,11 @@ func TestWritePromptFileErrors(t *testing.T) {
 	prevCreate, prevRemove := createTemp, removeFile
 	t.Cleanup(func() { createTemp, removeFile = prevCreate, prevRemove })
 	createTemp = func(string, string) (*os.File, error) { return nil, errors.New("create") }
-	if _, err := Call(bg, &fakeRunner{}, "grok", []byte("p")); err == nil || !strings.Contains(err.Error(), "create") {
-		t.Fatal(err)
+	for _, model := range []string{"grok", "astra"} {
+		fr := &fakeRunner{}
+		if _, err := Call(bg, fr, model, []byte("p")); err == nil || !strings.Contains(err.Error(), "create") || len(fr.callList()) != 0 {
+			t.Fatalf("%s: %v", model, err)
+		}
 	}
 	// A file that is already closed fails Write; the partial file is removed.
 	var made string

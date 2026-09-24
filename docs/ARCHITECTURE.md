@@ -44,8 +44,11 @@ abbreviated — task-done/epic-ready/pr-ready also take `--evidence <file>` (a v
 It reviews the first-party source at HEAD — code `Classify` keeps, minus tests, vendored trees,
 generated files, and non-UTF-8, narrowed to `--path` when given (a sample of the real checkout) — by calling the logged-in `claude`, `codex`, or `grok` CLI, up to `--jobs`
 prompts at once (default 8), each call killed with its process group past `--call-timeout` (default 30m).
-Grok runs as one tool-less turn (`--prompt-file --verbatim --json-schema --tools "" --max-turns 1
---system-prompt-override`): `grok -p` hands a large prompt to its agent as an excerpt it re-reads with tools.
+Every model gets the same setup — one system prompt, one findings JSON schema, no tools, one answer — so they
+are compared on the same job: `claude -p --tools "" --system-prompt --json-schema --strict-mcp-config`,
+`grok --prompt-file --verbatim --json-schema --tools "" --max-turns 1 --system-prompt-override` (`grok -p` hands
+a large prompt to its agent as an excerpt it re-reads with tools), and `codex exec -s read-only --output-schema`
+(Codex has no switch to remove its tools or replace its system prompt, so it is the one that differs).
 It does not use the diff-review anchor gate, `ValidatePayload`, `internal/shardpack`, or `review-lenses`.
 
 `epic-ready` runs *after* every child task is task-done-reviewed. It reviews the epic's **integration diff**
