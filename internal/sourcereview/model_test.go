@@ -159,6 +159,7 @@ func grokWant(promptFile string) []string {
 		"--json-schema", findingsSchema,
 		"--tools", "", "--max-turns", "1", "--no-subagents", "--disable-web-search",
 		"--system-prompt-override", sharedSystem,
+		"--reasoning-effort", "medium",
 	}
 }
 

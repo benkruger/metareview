@@ -46,7 +46,8 @@ generated files, and non-UTF-8, narrowed to `--path` when given (a sample of the
 prompts at once (default 8), each call killed with its process group past `--call-timeout` (default 30m).
 Every model gets the same setup — one system prompt, one findings JSON schema, no tools, one answer — so they
 are compared on the same job: `claude -p --tools "" --system-prompt --json-schema --strict-mcp-config`,
-`grok --prompt-file --verbatim --json-schema --tools "" --max-turns 1 --system-prompt-override` (`grok -p` hands
+`grok --prompt-file --verbatim --json-schema --tools "" --max-turns 1 --system-prompt-override --reasoning-effort
+medium` (medium was faster than the default with no lost findings; `grok -p` hands
 a large prompt to its agent as an excerpt it re-reads with tools), and `codex exec -s read-only --output-schema`
 (Codex has no switch to remove its tools or replace its system prompt, so it is the one that differs).
 It does not use the diff-review anchor gate, `ValidatePayload`, `internal/shardpack`, or `review-lenses`.

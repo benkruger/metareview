@@ -109,6 +109,9 @@ func codexArgs(schemaFile string) []string {
 // grokArgs runs Grok as one turn with no tools. -p hands a large prompt to
 // Grok's agent as an excerpt plus a file to read back with tools, which made
 // one hh prompt take 11 model calls; --prompt-file with --verbatim sends it whole.
+// --reasoning-effort medium: on one hh file (5 runs against 5) it took 502 s
+// against 623 s at the default, with more findings and every core bug found.
+// low is faster still but loses findings.
 func grokArgs(promptFile string) []string {
 	return []string{
 		"--prompt-file", promptFile, "--verbatim",
@@ -116,6 +119,7 @@ func grokArgs(promptFile string) []string {
 		"--json-schema", findingsSchema,
 		"--tools", "", "--max-turns", "1", "--no-subagents", "--disable-web-search",
 		"--system-prompt-override", reviewSystem,
+		"--reasoning-effort", "medium",
 	}
 }
 
