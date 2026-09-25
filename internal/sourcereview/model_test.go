@@ -124,7 +124,7 @@ func TestCallShapes(t *testing.T) {
 		c := fr.calls[0]
 		switch model {
 		case "opus":
-			want := []string{"-p", "--model", "opus", "--output-format", "json", "--tools", "", "--system-prompt", sharedSystem, "--json-schema", findingsSchema, "--strict-mcp-config", "--no-session-persistence"}
+			want := []string{"-p", "--model", "opus", "--output-format", "json", "--tools", "", "--system-prompt", sharedSystem, "--json-schema", findingsSchema, "--strict-mcp-config", "--no-session-persistence", "--effort", "medium"}
 			if c.name != "claude" || !reflectArgs(c.args, want) || !bytes.Equal(c.stdin, prompt) {
 				t.Fatalf("claude call %+v", c)
 			}

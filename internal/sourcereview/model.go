@@ -87,12 +87,14 @@ const findingsSchema = `{"type":"object","properties":{"findings":{"type":"array
 const reviewSystem = "You are a code reviewer. You have no tools. Everything you need is in the user message. Answer in a single message."
 
 // claudeArgs runs Claude as one turn with no tools, no MCP servers, and no
-// saved session. The prompt is on stdin.
+// saved session, at medium effort to match Grok's --reasoning-effort medium.
+// The prompt is on stdin.
 func claudeArgs() []string {
 	return []string{
 		"-p", "--model", "opus", "--output-format", "json",
 		"--tools", "", "--system-prompt", reviewSystem, "--json-schema", findingsSchema,
 		"--strict-mcp-config", "--no-session-persistence",
+		"--effort", "medium",
 	}
 }
 
