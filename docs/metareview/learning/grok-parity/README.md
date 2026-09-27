@@ -1,8 +1,9 @@
 # Grok parity checkpoint
 
-The quality/speed goal is **not achieved**. No benchmark is running. The current
-work is cleanup and verification, following the user's request to stop the
-open-ended experiment loop.
+The quality/speed goal is **not achieved**. No benchmark is running. Cleanup is
+committed and full validation passed. The revised goal limits each future work
+batch to one paired benchmark and 30 minutes, followed by a user checkpoint.
+The next batch only scores the completed run; it makes no new model calls.
 
 Local code commit `6775da0` fixes model-call isolation, Grok tool disabling,
 shared effort/system-prompt handling, incomplete-response rejection, and valid
@@ -10,7 +11,8 @@ filenames containing double dots. It also adds tests and updates the architectur
 reference. The source-review package tests pass at 100% statement coverage.
 These are correctness fixes; no experimental speed candidate has been promoted.
 
-- [Goal](goal.md): preserved goal definition, originally at the repository root.
+- [Goal](goal.md): current acceptance criteria and bounded execution rules. The
+  previous definition remains in git history (`08ce3cf`).
 - [Experiment history](experiment-history.md): preserved detailed log, originally
   `metareview-grok-parity-progress.md`. Historical paths and observations are retained.
 - The four historical goal reviews and context snapshots remain in the existing
