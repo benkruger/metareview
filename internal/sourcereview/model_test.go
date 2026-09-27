@@ -129,7 +129,7 @@ func TestCallShapes(t *testing.T) {
 				t.Fatalf("claude call %+v", c)
 			}
 		case "astra":
-			want := []string{"exec", "--json", "-m", "gpt-6-astra", "-s", "read-only", "--ephemeral", "--output-schema", schemaFile, "-"}
+			want := []string{"exec", "--json", "-m", "gpt-6-astra", "-s", "read-only", "--ephemeral", "--skip-git-repo-check", "--output-schema", schemaFile, "-"}
 			if c.name != "codex" || !reflectArgs(c.args, want) || !bytes.Equal(c.stdin, prompt) {
 				t.Fatalf("codex call %+v", c)
 			}
@@ -157,7 +157,8 @@ func grokWant(promptFile string) []string {
 		"--prompt-file", promptFile, "--verbatim",
 		"-m", "grok-4.7", "--output-format", "json",
 		"--json-schema", findingsSchema,
-		"--tools", "", "--max-turns", "1", "--no-subagents", "--disable-web-search",
+		"--tools", "read_file", "--disallowed-tools", "read_file,search_tool,use_tool",
+		"--max-turns", "1", "--no-subagents", "--disable-web-search",
 		"--system-prompt-override", sharedSystem,
 		"--reasoning-effort", "medium",
 	}
@@ -370,6 +371,26 @@ func TestCallErrors(t *testing.T) {
 	}
 }
 
+func TestModelTextRejectsIncompleteAnswer(t *testing.T) {
+	for _, c := range []struct {
+		model string
+		raw   string
+	}{
+		{"opus", `{"stop_reason":"max_tokens","result":"{\"findings\":[]}"}`},
+		{"grok", `{"stopReason":"max_tokens","text":"{\"findings\":[]}"}`},
+		{"grok", `{"structuredOutputError":"model did not produce structured output","text":"{\"findings\":[]}"}`},
+	} {
+		t.Run(c.model+c.raw, func(t *testing.T) {
+			fr := &fakeRunner{reply: func(int, string, []string, []byte) ([]byte, error) {
+				return []byte(c.raw), nil
+			}}
+			if text, err := Call(bg, fr, c.model, []byte("review source")); err == nil || text != "" {
+				t.Fatalf("incomplete response accepted: text=%q err=%v", text, err)
+			}
+		})
+	}
+}
+
 func TestOSRunner(t *testing.T) {
 	out, err := OSRunner{}.Run(bg, "echo", []string{"hi"}, nil)
 	if err != nil || !bytes.Contains(out, []byte("hi")) {
@@ -397,6 +418,33 @@ func TestOSRunner(t *testing.T) {
 	// exec.Command is used; a lookup failure is *exec.Error, not ExitError.
 	if _, err := exec.LookPath("echo"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOSRunnerIsolatesWorkspace(t *testing.T) {
+	t.Setenv("GROK_CLAUDE_SKILLS_ENABLED", "true")
+	t.Setenv("CLAUDE_CODE_SAFE_MODE", "0")
+	t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", "high")
+	t.Setenv("GROK_CONFIG", `{"models":{"default":"a-different-model"}}`)
+	for _, exit := range []string{"0", "1"} {
+		out, err := OSRunner{}.Run(bg, "sh", []string{"-c", `pwd; printf '%s\n' "$GROK_CLAUDE_SKILLS_ENABLED" "$CLAUDE_CODE_SAFE_MODE" "$GROK_CONFIG" "$CLAUDE_CODE_EFFORT_LEVEL"; exit "$1"`, "sh", exit}, nil)
+		if (err == nil) != (exit == "0") {
+			t.Fatalf("exit %s: %v", exit, err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) != 5 || !strings.HasPrefix(filepath.Base(lines[0]), "metareview-workspace-") || lines[1] != "false" || lines[2] != "1" || lines[3] != `{"models":{"default":"grok-4.7"}}` || lines[4] != "medium" {
+			t.Fatalf("unexpected workspace or environment: %q", out)
+		}
+		if _, err := os.Stat(lines[0]); !os.IsNotExist(err) {
+			t.Fatalf("workspace remains after exit %s: %v", exit, err)
+		}
+	}
+}
+
+func TestOSRunnerWorkspaceFailure(t *testing.T) {
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing"))
+	if _, err := (OSRunner{}).Run(bg, "echo", []string{"not started"}, nil); err == nil {
+		t.Fatal("workspace creation failure must fail the call")
 	}
 }
 

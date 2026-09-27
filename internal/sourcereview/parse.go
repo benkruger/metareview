@@ -73,7 +73,9 @@ func Parse(text string, files map[string][]byte) ([]lensoutput.TypedFinding, []s
 func resolveKept(cited string, files map[string][]byte) (string, error) {
 	shown := cited
 	cited = strings.ReplaceAll(strings.TrimSpace(cited), "\\", "/")
-	if cited == "" || strings.Contains(cited, "..") {
+	// Only a complete parent-directory component is traversal. Literal dots
+	// in a kept file or directory name must not discard a valid citation.
+	if cited == "" || strings.Contains("/"+cited+"/", "/../") {
 		return "", fmt.Errorf("file is not kept: %s", shown)
 	}
 	cited = strings.TrimPrefix(cited, "./")

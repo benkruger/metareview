@@ -46,10 +46,19 @@ generated files, and non-UTF-8, narrowed to `--path` when given (a sample of the
 prompts at once (default 8), each call killed with its process group past `--call-timeout` (default 30m).
 Every model gets the same setup — one system prompt, one findings JSON schema, no tools, one answer — so they
 are compared on the same job: `claude -p --tools "" --system-prompt --json-schema --strict-mcp-config`,
-`grok --prompt-file --verbatim --json-schema --tools "" --max-turns 1 --system-prompt-override --reasoning-effort
-medium` (medium was faster than the default with no lost findings; `grok -p` hands
-a large prompt to its agent as an excerpt it re-reads with tools), and `codex exec -s read-only --output-schema`
+`grok --prompt-file --verbatim --json-schema --tools read_file --disallowed-tools read_file,search_tool,use_tool
+--max-turns 1 --system-prompt-override --reasoning-effort medium`
+(`grok --tools ""` retains the default tools; a nonempty allowlist followed by denial actually removes them;
+`grok -p` hands a large prompt to its agent as an excerpt it re-reads with tools), and
+`codex exec -s read-only --skip-git-repo-check --output-schema`
 (Codex has no switch to remove its tools or replace its system prompt, so it is the one that differs).
+Calls start in an empty temporary working directory, cleaned after success or failure, so the host project's
+rules are not injected. Per-process settings disable Claude customizations and Grok's Claude/Cursor compatibility
+instructions. Native provider context can still differ. Grok's requested model is also set as its initial
+default: switching models after initialization otherwise replaces the supplied system prompt. Claude's effort
+environment override is set explicitly because it takes precedence over the CLI flag. Neither provider's
+global configuration is edited. Explicit token-limit stops and Grok structured-output failures fail the call,
+even if response text happens to parse as findings JSON.
 It does not use the diff-review anchor gate, `ValidatePayload`, `internal/shardpack`, or `review-lenses`.
 
 `epic-ready` runs *after* every child task is task-done-reviewed. It reviews the epic's **integration diff**

@@ -161,6 +161,24 @@ func TestResolveShortPath(t *testing.T) {
 	}
 }
 
+func TestResolveKeptLiteralDoubleDots(t *testing.T) {
+	files := map[string][]byte{
+		"web/.. -t=silently/coverage/index.html": []byte("source\n"),
+		"pkg/file..name.go":                      []byte("source\n"),
+	}
+	for p := range files {
+		got, err := resolveKept(p, files)
+		if err != nil || got != p {
+			t.Fatalf("valid kept path %q was rejected: %q %v", p, got, err)
+		}
+	}
+	for _, p := range []string{"..", "../pkg/file..name.go", "other/../pkg/file..name.go", "pkg/..", `other\..\pkg\file..name.go`} {
+		if _, err := resolveKept(p, files); err == nil {
+			t.Fatalf("parent traversal accepted: %q", p)
+		}
+	}
+}
+
 func TestLineCountAndSplit(t *testing.T) {
 	if lineCount(nil) != 0 || splitLines(nil) != nil {
 		t.Fatal("empty")

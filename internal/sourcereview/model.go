@@ -28,8 +28,32 @@ type OSRunner struct{}
 // is killed (the internal/fsm/cmdexec pattern).
 const waitDelay = 2 * time.Second
 
+const (
+	grokModelID  = "grok-4.7"
+	reviewEffort = "medium"
+)
+
 func (OSRunner) Run(ctx context.Context, name string, args []string, stdin []byte) ([]byte, error) {
+	// Review only the supplied source. Starting in the host checkout injects
+	// unrelated project rules and skills into the model's conversation.
+	dir, err := os.MkdirTemp("", "metareview-workspace-*")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"CLAUDE_CODE_SAFE_MODE=1",
+		// Claude gives this environment variable precedence over --effort.
+		"CLAUDE_CODE_EFFORT_LEVEL="+reviewEffort,
+		// Selecting a different Grok model after initialization re-renders its
+		// coding-agent system prompt, discarding --system-prompt-override.
+		// Make the requested model the session default before initialization.
+		fmt.Sprintf(`GROK_CONFIG={"models":{"default":%q}}`, grokModelID),
+		"GROK_CLAUDE_AGENTS_ENABLED=false", "GROK_CLAUDE_RULES_ENABLED=false", "GROK_CLAUDE_SKILLS_ENABLED=false",
+		"GROK_CURSOR_AGENTS_ENABLED=false", "GROK_CURSOR_RULES_ENABLED=false", "GROK_CURSOR_SKILLS_ENABLED=false",
+	)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -39,7 +63,7 @@ func (OSRunner) Run(ctx context.Context, name string, args []string, stdin []byt
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		// Codex puts the turn failure on stdout and a snapshot warning on
 		// stderr. Keep both so a non-zero exit records the CLI's reason.
@@ -67,7 +91,7 @@ func ModelID(model string) (string, error) {
 	case "astra":
 		return "gpt-6-astra", nil
 	case "grok":
-		return "grok-4.7", nil
+		return grokModelID, nil
 	default:
 		return "", fmt.Errorf("unknown model %q (want astra, opus, or grok)", model)
 	}
@@ -94,7 +118,7 @@ func claudeArgs() []string {
 		"-p", "--model", "opus", "--output-format", "json",
 		"--tools", "", "--system-prompt", reviewSystem, "--json-schema", findingsSchema,
 		"--strict-mcp-config", "--no-session-persistence",
-		"--effort", "medium",
+		"--effort", reviewEffort,
 	}
 }
 
@@ -104,24 +128,27 @@ func claudeArgs() []string {
 func codexArgs(schemaFile string) []string {
 	return []string{
 		"exec", "--json", "-m", "gpt-6-astra",
-		"-s", "read-only", "--ephemeral", "--output-schema", schemaFile, "-",
+		"-s", "read-only", "--ephemeral", "--skip-git-repo-check", "--output-schema", schemaFile, "-",
 	}
 }
 
 // grokArgs runs Grok as one turn with no tools. -p hands a large prompt to
 // Grok's agent as an excerpt plus a file to read back with tools, which made
 // one hh prompt take 11 model calls; --prompt-file with --verbatim sends it whole.
-// --reasoning-effort medium: on one hh file (5 runs against 5) it took 502 s
-// against 623 s at the default, with more findings and every core bug found.
-// low is faster still but loses findings.
+// Effort is shared with Claude. Speed and independently verified quality are
+// measured together; a lower raw finding count alone does not establish a loss.
+// Grok treats --tools "" as the default toolset. Use a non-empty allowlist,
+// then deny that tool and the always-on MCP dispatchers. Deny takes precedence,
+// leaving no tools without maintaining an exhaustive list of built-in tools.
 func grokArgs(promptFile string) []string {
 	return []string{
 		"--prompt-file", promptFile, "--verbatim",
-		"-m", "grok-4.7", "--output-format", "json",
+		"-m", grokModelID, "--output-format", "json",
 		"--json-schema", findingsSchema,
-		"--tools", "", "--max-turns", "1", "--no-subagents", "--disable-web-search",
+		"--tools", "read_file", "--disallowed-tools", "read_file,search_tool,use_tool",
+		"--max-turns", "1", "--no-subagents", "--disable-web-search",
 		"--system-prompt-override", reviewSystem,
-		"--reasoning-effort", "medium",
+		"--reasoning-effort", reviewEffort,
 	}
 }
 
@@ -187,8 +214,9 @@ func Call(ctx context.Context, runner Runner, model string, prompt []byte) (stri
 
 func claudeModelText(stdout []byte) (string, error) {
 	var doc struct {
-		IsError bool    `json:"is_error"`
-		Result  *string `json:"result"`
+		IsError    bool    `json:"is_error"`
+		StopReason string  `json:"stop_reason"`
+		Result     *string `json:"result"`
 	}
 	if err := json.Unmarshal(stdout, &doc); err != nil {
 		return "", fmt.Errorf("missing model text: %w", err)
@@ -199,6 +227,9 @@ func claudeModelText(stdout []byte) (string, error) {
 			msg = *doc.Result
 		}
 		return "", fmt.Errorf("claude: is_error: %s", msg)
+	}
+	if doc.StopReason == "max_tokens" {
+		return "", errors.New("claude: incomplete review: max_tokens")
 	}
 	if doc.Result == nil || *doc.Result == "" {
 		return "", errors.New("missing model text")
@@ -237,10 +268,18 @@ func codexModelText(stdout []byte) (string, error) {
 
 func grokModelText(stdout []byte) (string, error) {
 	var doc struct {
-		Text *string `json:"text"`
+		Text                  *string `json:"text"`
+		StopReason            string  `json:"stopReason"`
+		StructuredOutputError string  `json:"structuredOutputError"`
 	}
 	if err := json.Unmarshal(stdout, &doc); err != nil {
 		return "", fmt.Errorf("missing model text: %w", err)
+	}
+	if doc.StopReason == "max_tokens" {
+		return "", errors.New("grok: incomplete review: max_tokens")
+	}
+	if doc.StructuredOutputError != "" {
+		return "", fmt.Errorf("grok: %s", doc.StructuredOutputError)
 	}
 	if doc.Text == nil || *doc.Text == "" {
 		return "", errors.New("missing model text")
