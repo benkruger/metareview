@@ -394,3 +394,51 @@ Reference B1-245 is reconfirmed with a different reachable trigger, preserving a
 
 
 Predicate-coverage benchmark completed: Opus175.8631s/28findings; Grok410.2788s/41findings (2.3329x), all calls complete, clean exit and pinned source unchanged. Quality adjudication has not yet been completed; no PASS or full run claimed. User requested a candid status checkpoint after the long experiment loop. No benchmark is currently running.
+
+
+## September 29 bounded autonomous campaign
+
+The campaign began at 13:59:36 UTC with an absolute experiment deadline of
+15:39:36 UTC and total deadline of 15:59:36 UTC. The existing private handoff
+records these limits and counters across continuations. The existing run harness
+now refuses an unregistered candidate, missing state, an expired deadline, an
+exhausted attempt limit or a stopped campaign before invoking a provider. Its
+process-group timeout is capped by the remaining experiment budget. Seven guard
+cases passed without model calls.
+
+Scored the previously completed `screen-focused-predicate-coverage-fast-fixed`:
+Opus 175.8631s, Grok 410.2788s (2.3329x), **11/14 required roots**. The final
+findings omit the weekend preset gap, extended-regex whitespace and inactive-alias
+nil dereference. The department/town nil lookup is a different path and does not
+cover the alias defect. Reused the existing source-backed reference adjudications;
+no reference acceptance was changed. Reject on recall without completing an
+unnecessary false-positive inventory. Its scorecard remains private.
+
+Candidate 1, `screen-focused-findings-only-fast-fixed`, changes only the final
+verification payload: retain every raw draft finding and source line, but discard
+the draft audit narratives. This tests false assurances in those narratives being
+repeated by verification. A regression reproduced that forwarding before the
+change; isolation, context, audit and verification preflights pass after it. All
+24 discovery prompts match the prior control byte for byte. Opus finished in
+121.6276s with 25 findings. Grok hit its 364.8829s deadline and stopped in 364.9931s;
+all 24 discovery calls completed, six verification calls started and none completed.
+Cleanup succeeded. No final Grok review exists, so no quality score is accepted.
+This is the first non-improvement; nothing is promoted.
+
+Candidate 2, `screen-focused-findings-only-46-fixed`, changes only the Grok model
+from 4.7-build-fast to 4.6. Earlier evidence showed faster 4.6 discovery, but its
+medium-verification experiment timed out and lacked the current runtime notes.
+Both providers retain the same source, context, prompts, audit schema, tools,
+low effort, concurrency and review stages. Preflights pass. Opus finished in
+118.6537s with 26 findings; Grok finished in 257.1117s with 48 findings (2.1669x).
+All 30 calls completed for each model; source remained pinned and cleanup succeeded.
+The final Grok findings cover **11/14 required roots**, missing the same three as
+the existing predicate result. Reject on recall; false and mixed claims remain
+unresolved and no false-positive total is asserted.
+
+At 14:22:41 UTC the two consecutive non-improvements ended the campaign. The
+persisted state is `STOPPED_NO_IMPROVEMENT`; the harness refuses another launch.
+No third candidate or full-repository model run was launched, and no experimental
+speed change entered product code. Raw results, prototypes, scorecards and the
+harness stay in the existing private artifact directory. The whole-repository
+quality/speed goal remains unfinished.
