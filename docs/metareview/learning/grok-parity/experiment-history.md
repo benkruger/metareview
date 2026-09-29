@@ -442,3 +442,37 @@ No third candidate or full-repository model run was launched, and no experimenta
 speed change entered product code. Raw results, prototypes, scorecards and the
 harness stay in the existing private artifact directory. The whole-repository
 quality/speed goal remains unfinished.
+
+## September 29 user-authorized accuracy diagnostics
+
+After the prior campaign stopped, the user explicitly authorized testing isolated
+verification and smaller discovery contexts. A separate bounded diagnostic record
+preserves the old campaign; no acceptance criterion changed. Product code stayed
+unchanged and all private inputs and prototypes stayed outside the repository.
+
+`isolated-claim-diagnostic` replayed each provider's own saved reliability findings
+from the problematic source group: five Opus and seven Grok candidates, each judged
+separately against the original source context. Both used the same system prompt,
+decision schema, low effort, disabled tools and eight-worker limit. Code assembles
+accepted findings; an unresolved decision prevents a successful report. All twelve
+calls completed. Opus took 47.7650s; Grok took 45.1729s. Grok retained the verified
+inactive-alias crash that its combined verifier had discarded, but also retained
+questionable claims and returned one unresolved decision about nil billed amounts.
+Its report therefore failed. No precision or complete-pipeline improvement is claimed.
+
+`small-discovery-diagnostic` used the existing values-focused instructions and source
+dependency selection, one target at a time, with a 48,000-byte prompt budget.
+Preflight rejected a 32,000-byte version that omitted the dashboard query dependency;
+no model call used it. Both models received identical final prompts (47,849 and
+47,905 bytes), system prompts, schemas and settings. Opus completed both calls in
+17.4234s. Grok completed the dashboard call but missed the weekend gap and claimed
+that no text-filter keyup handler exists. That claim is contradicted by the layout's
+included `_table_search` partial, which the reduced context omitted. The ban-parser
+call timed out: deadline 52.2702s, elapsed including cleanup 52.3753s. Its regex
+detection is unscored because no completed response exists. Descendant cleanup
+succeeded and the pinned `hh` HEAD was unchanged.
+
+Both diagnostics are rejected for promotion. Their timings cover isolated stages,
+not source-review end to end. No new 24-file or full-repository pair was launched.
+The handoff records two non-improvements and refuses further launches; the limited
+retention signal is saved without claiming parity or weakening accuracy requirements.
