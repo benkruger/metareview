@@ -530,3 +530,90 @@ This is a useful local recovery signal, not an accuracy pass. Two diagnostics fa
 the no-regression requirement, so the batch stopped without expanding to the24-file
 sample or whole repository. All prototypes remain private; no product change or
 benchmark acceptance was promoted.
+
+## September 29: five requested options on untuned primary files
+
+The user explicitly authorized trying all five proposed options and keeping only
+improvements. This batch started at 21:05:28 UTC, with an experiment deadline of
+22:45:28 and closure deadline of 23:05:28. That authorization superseded the old
+three-candidate/two-failure stopping limits for this batch. The source revision,
+reference, quality requirements and whole-review speed requirements stayed fixed.
+All requested trials finished before the deadline; no implementation qualified.
+
+The fifth option, untuned-code evaluation, applied to every trial. Before new prompt
+design, a deterministic hash selection chose two primary files each from controller,
+model and frontend strata, excluding previous narrowed-review primary targets.
+Each selected file has a verified important reference root. These six files are
+untuned primary targets within the same repository, not a new unseen repository;
+some may previously have appeared as supporting context. The hypotheses, selection
+and initial scripts were frozen before reading their reference labels or outputs.
+Labels never entered provider prompts.
+
+The private harness used the logged-in Opus and Grok 4.6 CLIs, identical initial
+source/prompts/system/schema, low effort and a shared 16-worker limit. Models had
+no tools. Source-dependent follow-ups used each model's own findings and requests,
+with the same policy and accessible committed source. Review stages, per-run tool checks,
+startup and process cleanup were timed. Initial prompt packs were precomputed;
+these timings do not establish full-command performance. Grok was capped at three times fresh Opus
+elapsed time. The pinned source was checked before and after each provider; every
+check passed and descendant cleanup succeeded. Actual discovery prompts and shared
+settings were compared after execution. No full-repository run was launched.
+
+| Configuration | Opus seconds | Grok seconds | Grok recall screen | Decision |
+| --- | ---: | ---: | --- | --- |
+| Fresh control | 26.1739 | 60.6847 | 3 confirmed, at most 4 of 6 | Reject: missing date-default and radio-selection roots |
+| Source-linked grouping | 33.7866 | 68.6963 | 3 confirmed, at most 4 of 6 | Reject: missing timezone and radio-selection roots |
+| One bounded lookup | 49.3406 | 97.7715 | 4 confirmed, at most 5 of 6 | Reject: missing timezone root |
+| Standard tool evidence | 28.0442 | 84.2532 including cancellation | Incomplete; unscored | Reject: deadline 84.1326 exceeded |
+| Selective medium reasoning | 56.8381, failed | 97.9614, diagnostic | 4 of 6 | Reject: Opus unresolved; Grok misses concurrent-draft and date-default roots |
+
+For the first three Grok reports, possible additional recall credit for overlapping
+draft includes was left unresolved: they describe duplicate billing without tracing
+concurrency past the activation guard. Their other missing roots already establish
+failure even with that credit. Precision was not exhaustively adjudicated after
+these decisive failures. Each completed Grok report contains at least one verified
+false component about PDF widget values: the pinned and installed pdfjs-dist 6.3.289
+normalizes stored strings and uses boolean checkbox/radio widget state. The lookup
+and selective-effort outputs also identify the genuine loss of radio-option identity;
+they receive recall credit for it while retaining the false-component penalty.
+
+Source-linked grouping separated the six unrelated primary targets, using existing
+source/type/caller links and excluding high-fanout shared ancestors. This is an
+approximation to execution-flow grouping, not a compiler-resolved call graph. The
+existing supporting-context picker remained in use. Every primary was present once,
+all primary source was preserved, and all six initial prompts fit within 120,000 bytes.
+The control used two groups. Grok recovered the date-default root but lost the
+system-timezone root; the false widget-value claim persisted. Reject the prototype.
+
+Bounded lookup allowed at most three relative paths or symbols per group, four
+matches per request and 40 KB of additional committed source, followed by one completion
+call. Both providers returned empty request lists for both groups. Thus the code
+path was offered but retrieval itself was not exercised; this run does not establish
+whether useful requested context would help. Grok still missed the timezone root
+and retained a false library premise. Reject this configuration without another run.
+
+Standard evidence came from six syntax parses, the repository's RuboCop lint rules
+on four Ruby files, and ten existing companion JavaScript tests. All passed. The
+isolated snapshot used committed source and privately cloned installed dependencies,
+so compiler/test caches did not write into `hh`. Preflight repairs routed RuboCop
+JSON to its output file and fixed Vitest's external setup-path problem; no custom
+bug probes or tests were introduced. Both providers received byte-identical evidence,
+including existing test names and outcomes. Grok timed out before a complete report;
+partial responses were not scored as a successful review. Reject the prototype.
+
+Selective effort added a low-effort candidate checker, escalating at most two
+rejected or uncertain claims per group to medium reasoning. Opus made two medium
+calls: one narrowed a date-formatting claim, while the catalog-association crash
+remained uncertain, correctly preventing a successful report. Grok's arm was then
+run once diagnostically, bounded to 170.5142 seconds (three times that failed Opus
+elapsed time), to finish the requested option. Grok retained every candidate at low
+effort and therefore made zero medium calls. It missed two required roots and kept
+a false PDF-library premise. This is not evidence of medium-effort performance on
+Grok, nor a passing matched comparison. Reject the escalation policy as tested.
+
+All five requested options are now attempted, the launch guard is stopped, and
+no new product code, full-sample run or full-repository run is being promoted.
+This records failures of these prototypes, not proof that the ideas cannot work.
+Private manifests, scripts, prompts, outputs, timings and claim mappings remain
+under the existing private benchmark directory; only this results checkpoint and
+its required review artifacts are committed.
