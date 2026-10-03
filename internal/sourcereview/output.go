@@ -1,6 +1,7 @@
 package sourcereview
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,10 @@ var reportLstat = os.Lstat
 // either saved report. Publication errors restore the previous pair. Renaming
 // two files is not an atomic transaction for concurrent readers or process crashes.
 func publishReports(opts Options, findings, page []byte) error {
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	write, rename, remove := opts.WriteFile, opts.Rename, opts.Remove
 	if write == nil {
 		write = os.WriteFile
@@ -43,6 +48,9 @@ func publishReports(opts Options, findings, page []byte) error {
 	}
 	reports := []report{{name: "findings.json", body: findings}, {name: "review.html", body: page}}
 	for i := range reports {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		r := &reports[i]
 		if err := write(filepath.Join(stage, r.name), r.body, 0o644); err != nil {
 			return err
@@ -79,6 +87,9 @@ func publishReports(opts Options, findings, page []byte) error {
 		return cause
 	}
 	for i := range reports {
+		if err := ctx.Err(); err != nil {
+			return rollback(err)
+		}
 		r := &reports[i]
 		if r.exists {
 			if err := rename(filepath.Join(opts.OutputDir, r.name), filepath.Join(stage, r.name+".previous")); err != nil {
@@ -88,11 +99,17 @@ func publishReports(opts Options, findings, page []byte) error {
 		}
 	}
 	for i := range reports {
+		if err := ctx.Err(); err != nil {
+			return rollback(err)
+		}
 		r := &reports[i]
 		if err := rename(filepath.Join(stage, r.name), filepath.Join(opts.OutputDir, r.name)); err != nil {
 			return rollback(err)
 		}
 		r.published = true
+	}
+	if err := ctx.Err(); err != nil {
+		return rollback(err)
 	}
 	return nil
 }

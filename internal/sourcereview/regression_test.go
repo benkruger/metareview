@@ -112,6 +112,21 @@ func TestSelectNewlineFilenames(t *testing.T) {
 	}
 }
 
+func TestExactFindingFilenameWinsOverNormalization(t *testing.T) {
+	files := map[string][]byte{
+		"\napp.go": []byte("package newline\n"), "app.go": []byte("package app\n"),
+		"pkg/a\\b.go": []byte("package backslash\n"), "pkg/a/b.go": []byte("package slash\n"),
+		" app.go ": []byte("package spaced\n"),
+	}
+	for cited := range files {
+		text := fmt.Sprintf(`{"findings":[{"tag":"bug","file":%q,"start_line":1,"end_line":1,"issue":"i","consequence":"c","confidence":80,"severity":"P1"}]}`, cited)
+		got, skipped, err := Parse(text, files)
+		if err != nil || len(skipped) != 0 || len(got) != 1 || got[0].File != cited {
+			t.Fatalf("exact filename changed: cited=%q got=%v skipped=%v err=%v", cited, got, skipped, err)
+		}
+	}
+}
+
 func TestRunContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

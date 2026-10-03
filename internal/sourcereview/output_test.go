@@ -1,6 +1,7 @@
 package sourcereview
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,61 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestReportPublicationCancellationPreservesPreviousPair(t *testing.T) {
+	for cancelAfter := 0; cancelAfter <= 6; cancelAfter++ {
+		t.Run(fmt.Sprintf("after-operation-%d", cancelAfter), func(t *testing.T) {
+			dir := t.TempDir()
+			names := []string{"findings.json", "review.html"}
+			seedReports(t, dir, names)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			n := 0
+			completed := func() {
+				n++
+				if n == cancelAfter {
+					cancel()
+				}
+			}
+			if cancelAfter == 0 {
+				cancel()
+			}
+			err := publishReports(Options{Context: ctx, OutputDir: dir,
+				WriteFile: func(p string, body []byte, mode os.FileMode) error {
+					if err := os.WriteFile(p, body, mode); err != nil {
+						return err
+					}
+					completed()
+					return nil
+				}, Rename: func(from, to string) error {
+					if err := os.Rename(from, to); err != nil {
+						return err
+					}
+					completed()
+					return nil
+				}}, []byte("new findings"), []byte("new page"))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			checkOldReports(t, dir, names)
+		})
+	}
+}
+
+func TestRunCancellationDuringReportSetup(t *testing.T) {
+	root, _ := newRepoBytes(t, droppedOnlyFiles())
+	dir := t.TempDir()
+	names := []string{"findings.json", "review.html"}
+	seedReports(t, dir, names)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err := Run(Options{Context: ctx, Repo: root, Model: "opus", OutputDir: dir,
+		MkdirAll: func(p string, mode os.FileMode) error { cancel(); return os.MkdirAll(p, mode) }})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	checkOldReports(t, dir, names)
+}
 
 var oldReports = map[string]string{"findings.json": "old findings", "review.html": "old page"}
 

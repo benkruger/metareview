@@ -82,6 +82,9 @@ func TestRenderFiltersAndQuote(t *testing.T) {
 	if !reflectArgs(report.Search.Displays, []string{"none", "", "none", "none"}) || report.Search.Shown != "Showing 1 of 4" {
 		t.Fatalf("search %+v", report.Search)
 	}
+	if !reflectArgs(report.FileSearch.Displays, []string{"none", "", "none", "none"}) || report.FileSearch.Shown != "Showing 1 of 4" {
+		t.Fatalf("filename search %+v", report.FileSearch)
+	}
 }
 
 func TestPageHelpers(t *testing.T) {
@@ -150,7 +153,7 @@ func TestRenderRangesAndGutter(t *testing.T) {
 	for _, want := range []string{
 		"<h1>app</h1>", "L2–3", `<pre class="gutter" aria-hidden="true">2` + "\n3</pre>", `<pre class="quote">beta` + "\ngamma</pre>",
 		`<span class="lead">First sentence.</span><span class="rest"> Second sentence.</span>`,
-		`<span class="dir">pkg/</span>app.go`, "Model confidence 80 of 100", "The one finding is a P2.", `data-area="pkg"`,
+		`<span class="dir">pkg/</span>app.go`, "Model confidence 80 of 100", "The one finding is a P2.", `data-area="pkg"`, `data-file="pkg/app.go"`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("page missing %q", want)
@@ -228,6 +231,10 @@ type pageReport struct {
 		Displays []string `json:"displays"`
 		Shown    string   `json:"shown"`
 	} `json:"search"`
+	FileSearch struct {
+		Displays []string `json:"displays"`
+		Shown    string   `json:"shown"`
+	} `json:"fileSearch"`
 }
 
 func runPage(t *testing.T, page []byte) pageReport {
@@ -410,6 +417,10 @@ if (findings.length >= 2) {
   search.value = findings[1].querySelector(".issue").textContent.trim().toUpperCase();
   search.dispatchEvent("input");
   report.search = { displays: displays(), shown: shown() };
+  // Filename matching is separate from issue/snippet text and ignores case.
+  search.value = findings[1].getAttribute("data-file").split("/").pop().toUpperCase();
+  search.dispatchEvent("input");
+  report.fileSearch = { displays: displays(), shown: shown() };
 }
 process.stdout.write(JSON.stringify(report));
 `

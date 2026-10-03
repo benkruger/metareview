@@ -71,6 +71,9 @@ func Parse(text string, files map[string][]byte) ([]lensoutput.TypedFinding, []s
 // citation, so "vite.config.js" means "web/vite.config.js" when that is the
 // only such file. Zero matches or two matches fail the run.
 func resolveKept(cited string, files map[string][]byte) (string, error) {
+	if _, ok := files[cited]; ok {
+		return cited, nil
+	}
 	shown := cited
 	cited = strings.ReplaceAll(strings.TrimSpace(cited), "\\", "/")
 	// Only a complete parent-directory component is traversal. Literal dots

@@ -234,7 +234,8 @@ const pageScript = `
       var okS = s === "" || el.getAttribute("data-severity") === s;
       var okD = d === "" || el.getAttribute("data-dir") === d;
       var okA = area === "" || el.getAttribute("data-area") === area;
-      var okQ = q === "" || el.textContent.toLowerCase().indexOf(q) >= 0;
+      var file = el.getAttribute("data-file") || "";
+      var okQ = q === "" || file.toLowerCase().indexOf(q) >= 0 || el.textContent.toLowerCase().indexOf(q) >= 0;
       var ok = okS && okD && okA && okQ;
       el.style.display = ok ? "" : "none";
       if (ok) n++;
@@ -683,7 +684,7 @@ func Render(p Page) []byte {
 				lines = fmt.Sprintf("L%d–%d", f.StartLine, f.EndLine)
 			}
 			tag := string(f.Tag)
-			fmt.Fprintf(&b, "<article class=\"finding\" data-severity=\"%s\" data-dir=\"%s\" data-area=\"%s\">\n", html.EscapeString(f.Severity), html.EscapeString(dir), html.EscapeString(area(f.File)))
+			fmt.Fprintf(&b, "<article class=\"finding\" data-file=\"%s\" data-severity=\"%s\" data-dir=\"%s\" data-area=\"%s\">\n", html.EscapeString(f.File), html.EscapeString(f.Severity), html.EscapeString(dir), html.EscapeString(area(f.File)))
 			// The row shows the issue's first sentence; opening it reveals the rest in place.
 			issue := strings.TrimSpace(f.Issue)
 			lead := summary(issue)
