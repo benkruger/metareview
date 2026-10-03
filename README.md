@@ -43,13 +43,13 @@ get set up.**
 From a metareview source checkout, review a repository with Grok:
 
 ```bash
-bin/source-review grok /path/to/repo
+bin/source-review --model grok --repo /path/to/repo
 ```
 
-Replace `grok` with `opus` or `astra` to use another model. Omit the repository
-path to review your current directory. The script builds metareview automatically;
-you need Go and the selected model's CLI (`grok`, `claude`, or `codex`) installed
-and logged in.
+Both `--model` and `--repo` are required. Replace `grok` with `opus` or `astra`
+to use another model; use `--repo .` to review your current directory. The script
+builds metareview automatically. You need Go and a logged-in model CLI (`grok`,
+`claude`, or `codex`).
 
 Each run saves `findings.json` and an offline `review.html` in its own directory
 under `/tmp`; the script prints that directory before starting. It reviews the
