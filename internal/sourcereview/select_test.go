@@ -156,7 +156,7 @@ func TestParseTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(paths, []string{"file.go", "link"}) {
+	if !reflect.DeepEqual(paths, []treeBlob{{path: "file.go", id: "abc"}, {path: "link", id: "def"}}) {
 		t.Fatalf("%v", paths)
 	}
 	if _, err := parseTree([]byte("no-tab\x00")); err == nil {
@@ -199,17 +199,10 @@ func TestParseBatch(t *testing.T) {
 }
 
 func TestReadBlobsErrors(t *testing.T) {
-	git := func(string, []string, []byte) ([]byte, error) {
-		t.Fatal("git should not run")
-		return nil, nil
-	}
-	if _, err := readBlobs(".", []string{"a\nb"}, git); err == nil {
-		t.Fatal("newline path")
-	}
 	boom := func(string, []string, []byte) ([]byte, error) {
 		return nil, errors.New("git down")
 	}
-	if _, err := readBlobs(".", []string{"a.go"}, boom); err == nil {
+	if _, err := readBlobs(".", []treeBlob{{path: "a.go", id: "abc"}}, boom); err == nil {
 		t.Fatal("git error")
 	}
 	if files, err := readBlobs(".", nil, boom); err != nil || len(files) != 0 {

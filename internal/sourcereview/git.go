@@ -39,9 +39,15 @@ func resolveTop(root string, git GitFunc) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// parseTree reads `git ls-tree -r -z` records and returns blob paths.
-func parseTree(out []byte) ([]string, error) {
-	var paths []string
+type treeBlob struct {
+	path string
+	id   string
+}
+
+// parseTree reads `git ls-tree -r -z` records, preserving arbitrary filenames
+// and the object IDs used to read this exact snapshot.
+func parseTree(out []byte) ([]treeBlob, error) {
+	var blobs []treeBlob
 	rest := out
 	for len(rest) > 0 {
 		rec, next, _ := bytes.Cut(rest, []byte{0})
@@ -54,7 +60,7 @@ func parseTree(out []byte) ([]string, error) {
 			return nil, fmt.Errorf("bad ls-tree record")
 		}
 		fields := strings.Fields(string(rec[:tab]))
-		if len(fields) < 2 {
+		if len(fields) < 3 {
 			return nil, fmt.Errorf("bad ls-tree meta")
 		}
 		if fields[1] != "blob" {
@@ -64,21 +70,21 @@ func parseTree(out []byte) ([]string, error) {
 		if p == "" {
 			continue
 		}
-		paths = append(paths, p)
+		blobs = append(blobs, treeBlob{path: p, id: fields[2]})
 	}
-	return paths, nil
+	return blobs, nil
 }
 
-func readBlobs(root string, paths []string, git GitFunc) (map[string][]byte, error) {
-	if len(paths) == 0 {
+func readBlobs(root string, blobs []treeBlob, git GitFunc) (map[string][]byte, error) {
+	if len(blobs) == 0 {
 		return map[string][]byte{}, nil
 	}
 	var stdin bytes.Buffer
-	for _, p := range paths {
-		if strings.Contains(p, "\n") {
-			return nil, fmt.Errorf("path contains a newline")
-		}
-		fmt.Fprintf(&stdin, "HEAD:%s\n", p)
+	paths := make([]string, 0, len(blobs))
+	for _, b := range blobs {
+		// Object IDs avoid line-delimited filenames and any later HEAD lookup.
+		fmt.Fprintln(&stdin, b.id)
+		paths = append(paths, b.path)
 	}
 	out, err := git(root, []string{"cat-file", "--batch"}, stdin.Bytes())
 	if err != nil {

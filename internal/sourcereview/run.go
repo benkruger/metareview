@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dsifry/metareview/internal/lensoutput"
@@ -46,10 +48,12 @@ var (
 	statPath = os.Stat
 )
 
-// Options is one source-review run. A nil Runner, Git, MkdirAll, WriteFile, or
-// Remove uses the real process, git, or filesystem. Budget 0 means MaxPromptBytes.
+// Options is one source-review run. A nil Git, MkdirAll, WriteFile, Remove or
+// Rename uses the real git or filesystem. CLI supplies the OSRunner. A nil Context uses
+// context.Background. Budget 0 means MaxPromptBytes.
 // Jobs 0 means DefaultJobs and CallTimeout 0 means DefaultCallTimeout.
 type Options struct {
+	Context     context.Context
 	Repo        string
 	Model       string
 	OutputDir   string
@@ -66,11 +70,18 @@ type Options struct {
 	MkdirAll  func(string, os.FileMode) error
 	WriteFile func(string, []byte, os.FileMode) error
 	Remove    func(string) error
+	Rename    func(string, string) error
 }
 
 // Run reviews one repository. It writes the findings file and the page only
-// after every prompt succeeds. A failed prompt leaves the output directory empty.
+// after every prompt succeeds. A failed run preserves any previously saved reports.
 func Run(opts Options) error {
+	if opts.Context == nil {
+		opts.Context = context.Background()
+	}
+	if err := opts.Context.Err(); err != nil {
+		return err
+	}
 	if opts.Stdout == nil {
 		opts.Stdout = io.Discard
 	}
@@ -95,12 +106,11 @@ func Run(opts Options) error {
 	if err := refuseInside(top, opts.OutputDir); err != nil {
 		return err
 	}
-	kept, dropped, commit, err := Select(top, git)
+	kept, dropped, commit, err := selectPaths(top, git, opts.Paths)
 	if err != nil {
 		return err
 	}
-	kept, err = onlyPaths(kept, opts.Paths)
-	if err != nil {
+	if err := opts.Context.Err(); err != nil {
 		return err
 	}
 	writeLists(opts.Stdout, kept, dropped)
@@ -148,7 +158,7 @@ func review(opts Options, prompts [][]byte, files map[string][]byte) ([]lensoutp
 	if timeout < 0 {
 		return nil, fmt.Errorf("call timeout must be positive, got %s", timeout)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(opts.Context)
 	defer cancel()
 	var (
 		mu       sync.Mutex
@@ -166,9 +176,15 @@ func review(opts Options, prompts [][]byte, files map[string][]byte) ([]lensoutp
 	n := len(prompts)
 	results := make([][]lensoutput.TypedFinding, n)
 	sem := make(chan struct{}, jobs)
+schedule:
 	for i, p := range prompts {
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break schedule
+		}
 		if ctx.Err() != nil {
+			<-sem
 			break
 		}
 		mu.Lock()
@@ -182,6 +198,9 @@ func review(opts Options, prompts [][]byte, files map[string][]byte) ([]lensoutp
 			callCtx, callCancel := context.WithTimeout(ctx, timeout)
 			defer callCancel()
 			text, err := Call(callCtx, opts.Runner, opts.Model, p)
+			if err == nil {
+				err = callCtx.Err()
+			}
 			if err != nil {
 				if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
 					err = fmt.Errorf("call timed out after %s: %w", timeout, err)
@@ -207,6 +226,9 @@ func review(opts Options, prompts [][]byte, files map[string][]byte) ([]lensoutp
 	if firstErr != nil {
 		return nil, firstErr
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var all []lensoutput.TypedFinding
 	for _, r := range results {
 		all = append(all, r...)
@@ -227,6 +249,11 @@ func writePrompt(w io.Writer, p []byte) {
 // file. A path that matches no kept file is an error, so a typo or a file the
 // source cut dropped is reported instead of reviewing nothing.
 func onlyPaths(kept []File, paths []string) ([]File, error) {
+	var err error
+	paths, err = cleanPaths(paths)
+	if err != nil {
+		return nil, err
+	}
 	if len(paths) == 0 {
 		return kept, nil
 	}
@@ -235,8 +262,7 @@ func onlyPaths(kept []File, paths []string) ([]File, error) {
 	for _, f := range kept {
 		hit := false
 		for i, p := range paths {
-			p = path.Clean(p)
-			if f.Path == p || strings.HasPrefix(f.Path, p+"/") || p == "." {
+			if pathSelected(f.Path, []string{p}) {
 				matched[i] = true
 				hit = true
 			}
@@ -253,6 +279,29 @@ func onlyPaths(kept []File, paths []string) ([]File, error) {
 	return out, nil
 }
 
+func cleanPaths(paths []string) ([]string, error) {
+	cleaned := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			return nil, errors.New("--path must not be empty")
+		}
+		cleaned = append(cleaned, path.Clean(p))
+	}
+	return cleaned, nil
+}
+
+func pathSelected(file string, paths []string) bool {
+	if len(paths) == 0 {
+		return true
+	}
+	for _, p := range paths {
+		if file == p || strings.HasPrefix(file, p+"/") || p == "." {
+			return true
+		}
+	}
+	return false
+}
+
 func writeLists(w io.Writer, kept []File, dropped []string) {
 	fmt.Fprintln(w, "kept:")
 	for _, f := range kept {
@@ -265,33 +314,21 @@ func writeLists(w io.Writer, kept []File, dropped []string) {
 }
 
 func writeOutputs(opts Options, repo, commit, modelID string, findings []lensoutput.TypedFinding, files map[string][]byte) error {
+	if opts.Context != nil {
+		if err := opts.Context.Err(); err != nil {
+			return err
+		}
+	}
 	body := findingsJSON(findings)
 	page := Render(Page{Repo: repo, Commit: commit, ModelID: modelID, Findings: findings, Files: files})
 	mkdir := opts.MkdirAll
 	if mkdir == nil {
 		mkdir = os.MkdirAll
 	}
-	write := opts.WriteFile
-	if write == nil {
-		write = os.WriteFile
-	}
-	remove := opts.Remove
-	if remove == nil {
-		remove = os.Remove
-	}
 	if err := mkdir(opts.OutputDir, 0o755); err != nil {
 		return err
 	}
-	findingsPath := filepath.Join(opts.OutputDir, "findings.json")
-	pagePath := filepath.Join(opts.OutputDir, "review.html")
-	if err := write(findingsPath, body, 0o644); err != nil {
-		return err
-	}
-	if err := write(pagePath, page, 0o644); err != nil {
-		_ = remove(findingsPath)
-		return err
-	}
-	return nil
+	return publishReports(opts, body, page)
 }
 
 func findingsJSON(fs []lensoutput.TypedFinding) []byte {
@@ -387,7 +424,10 @@ func CLI(args []string, cwd string, stdout, stderr io.Writer) int {
 	if a.repo == "" {
 		a.repo = cwd
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	err = Run(Options{
+		Context:     ctx,
 		Repo:        a.repo,
 		Model:       a.model,
 		OutputDir:   a.out,
@@ -449,6 +489,9 @@ func (a *cliArgs) set(flag, v string) error {
 	case "--output":
 		a.out = v
 	case "--path":
+		if v == "" {
+			return errors.New("--path must not be empty")
+		}
 		a.paths = append(a.paths, v)
 	case "--jobs":
 		n, err := strconv.Atoi(v)

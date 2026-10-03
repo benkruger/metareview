@@ -609,7 +609,6 @@ func TestRunWriteErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "write") {
 		t.Fatal(err)
 	}
-	removed := false
 	n := 0
 	err = Run(Options{
 		Repo: root, Model: "opus", OutputDir: outDir, Stdout: &bytes.Buffer{},
@@ -620,12 +619,11 @@ func TestRunWriteErrors(t *testing.T) {
 			}
 			return os.WriteFile(path, data, mode)
 		},
-		Remove: func(string) error { removed = true; return nil },
 	})
-	if err == nil || !removed {
-		t.Fatalf("err=%v removed=%v", err, removed)
+	if err == nil || !strings.Contains(err.Error(), "page") {
+		t.Fatalf("err=%v", err)
 	}
-	// real Remove deletes the findings file when the page write fails
+	// Neither staged file is published when the page write fails.
 	n = 0
 	err = Run(Options{
 		Repo: root, Model: "opus", OutputDir: outDir, Stdout: &bytes.Buffer{},

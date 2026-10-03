@@ -214,9 +214,10 @@ func Call(ctx context.Context, runner Runner, model string, prompt []byte) (stri
 
 func claudeModelText(stdout []byte) (string, error) {
 	var doc struct {
-		IsError    bool    `json:"is_error"`
-		StopReason string  `json:"stop_reason"`
-		Result     *string `json:"result"`
+		IsError          bool            `json:"is_error"`
+		StopReason       string          `json:"stop_reason"`
+		Result           *string         `json:"result"`
+		StructuredOutput json.RawMessage `json:"structured_output"`
 	}
 	if err := json.Unmarshal(stdout, &doc); err != nil {
 		return "", fmt.Errorf("missing model text: %w", err)
@@ -230,6 +231,12 @@ func claudeModelText(stdout []byte) (string, error) {
 	}
 	if doc.StopReason == "max_tokens" {
 		return "", errors.New("claude: incomplete review: max_tokens")
+	}
+	if len(doc.StructuredOutput) > 0 && !bytes.Equal(doc.StructuredOutput, []byte("null")) {
+		if doc.StructuredOutput[0] != '{' {
+			return "", errors.New("claude: structured_output must be an object")
+		}
+		return string(doc.StructuredOutput), nil
 	}
 	if doc.Result == nil || *doc.Result == "" {
 		return "", errors.New("missing model text")

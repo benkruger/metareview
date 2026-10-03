@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -85,10 +86,12 @@ func Pack(files []File, budget int) ([][]byte, error) {
 	if budget <= 0 {
 		return nil, fmt.Errorf("prompt budget must be positive")
 	}
-	var whole, big []File
+	var whole []sizedFile
+	var big []File
 	for _, f := range files {
-		if len(promptWith(instruction, []File{f})) <= budget {
-			whole = append(whole, f)
+		size := len(f.Path) + 1 + numberedSize(f.Body)
+		if len(instruction)+1+size <= budget {
+			whole = append(whole, sizedFile{File: f, size: size})
 		} else {
 			big = append(big, f)
 		}
@@ -105,32 +108,58 @@ func Pack(files []File, budget int) ([][]byte, error) {
 	return prompts, nil
 }
 
-func packWhole(files []File, budget int) [][]byte {
-	sorted := append([]File(nil), files...)
+type sizedFile struct {
+	File
+	size int
+}
+
+// numberedSize measures the rendered body without building a prompt.
+func numberedSize(body []byte) int {
+	size := len(body)
+	for line := 1; len(body) > 0; line++ {
+		size += len(strconv.Itoa(line)) + 2
+		_, body, _ = bytes.Cut(body, []byte("\n"))
+	}
+	return size
+}
+
+func packWhole(files []sizedFile, budget int) [][]byte {
+	sorted := append([]sizedFile(nil), files...)
 	sort.Slice(sorted, func(i, j int) bool {
 		if len(sorted[i].Body) == len(sorted[j].Body) {
 			return sorted[i].Path < sorted[j].Path
 		}
 		return len(sorted[i].Body) > len(sorted[j].Body)
 	})
-	var bins [][]File
+	type bin struct {
+		files     []File
+		size      int
+		separator bool
+	}
+	var bins []bin
 	for _, f := range sorted {
 		placed := false
 		for i := range bins {
-			candidate := append(append([]File{}, bins[i]...), f)
-			if len(promptWith(instruction, candidate)) <= budget {
-				bins[i] = candidate
+			size := bins[i].size + f.size
+			if bins[i].separator {
+				size++
+			}
+			if size <= budget {
+				bins[i].files = append(bins[i].files, f.File)
+				bins[i].size = size
+				bins[i].separator = len(f.Body) == 0 || f.Body[len(f.Body)-1] != '\n'
 				placed = true
 				break
 			}
 		}
 		if !placed {
-			bins = append(bins, []File{f})
+			bins = append(bins, bin{files: []File{f.File}, size: len(instruction) + 1 + f.size,
+				separator: len(f.Body) == 0 || f.Body[len(f.Body)-1] != '\n'})
 		}
 	}
 	out := make([][]byte, 0, len(bins))
 	for _, bin := range bins {
-		out = append(out, promptWith(instruction, bin))
+		out = append(out, promptWith(instruction, bin.files))
 	}
 	return out
 }

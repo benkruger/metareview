@@ -25,6 +25,14 @@ var generatedLine = regexp.MustCompile(`^// Code generated .* DO NOT EDIT\.$`)
 // everything this command drops. Classify is unchanged: config and docs are
 // still Code/Config/Docs for the diff review; this command drops Config and Docs.
 func Select(root string, git GitFunc) (kept []File, dropped []string, commit string, err error) {
+	return selectPaths(root, git, nil)
+}
+
+func selectPaths(root string, git GitFunc, filters []string) (kept []File, dropped []string, commit string, err error) {
+	filters, err = cleanPaths(filters)
+	if err != nil {
+		return nil, nil, "", err
+	}
 	if git == nil {
 		git = realGit
 	}
@@ -37,19 +45,28 @@ func Select(root string, git GitFunc) (kept []File, dropped []string, commit str
 		return nil, nil, "", err
 	}
 	commit = strings.TrimSpace(string(head))
-	tree, err := git(top, []string{"ls-tree", "-r", "-z", "HEAD"}, nil)
+	tree, err := git(top, []string{"ls-tree", "-r", "-z", commit}, nil)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	paths, err := parseTree(tree)
+	entries, err := parseTree(tree)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	blobs, err := readBlobs(top, paths, git)
+	var selected []treeBlob
+	for _, entry := range entries {
+		if !eligiblePath(entry.path) {
+			dropped = append(dropped, entry.path)
+		} else if pathSelected(entry.path, filters) {
+			selected = append(selected, entry)
+		}
+	}
+	blobs, err := readBlobs(top, selected, git)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	for _, p := range paths {
+	for _, entry := range selected {
+		p := entry.path
 		body := blobs[p]
 		if keepPath(p, body) {
 			kept = append(kept, File{Path: p, Body: body})
@@ -59,19 +76,17 @@ func Select(root string, git GitFunc) (kept []File, dropped []string, commit str
 	}
 	sort.Slice(kept, func(i, j int) bool { return kept[i].Path < kept[j].Path })
 	sort.Strings(dropped)
+	kept, err = onlyPaths(kept, filters)
+	if err != nil {
+		return nil, nil, "", err
+	}
 	return kept, dropped, commit, nil
 }
 
 // keepPath is the whole-repo cut. An unrecognised path is still Code to Classify
 // and is kept when the other cuts do not apply.
 func keepPath(p string, body []byte) bool {
-	if classify.Classify(p) != classify.Code {
-		return false
-	}
-	if claimcheck.IsTestPath(p) {
-		return false
-	}
-	if vendored(p) {
+	if !eligiblePath(p) {
 		return false
 	}
 	if !utf8.Valid(body) {
@@ -81,6 +96,10 @@ func keepPath(p string, body []byte) bool {
 		return false
 	}
 	return true
+}
+
+func eligiblePath(p string) bool {
+	return classify.Classify(p) == classify.Code && !claimcheck.IsTestPath(p) && !vendored(p)
 }
 
 func vendored(p string) bool {
