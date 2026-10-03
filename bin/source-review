@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage: %s <grok|opus|astra> [repo]\n' "$0"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  usage >&2
+  exit 2
+fi
+
+model="$1"
+case "$model" in
+  grok|opus|astra) ;;
+  *) printf 'Unknown model: %s\n' "$model" >&2; usage >&2; exit 2 ;;
+esac
+
+# Resolve the caller's repo before moving into the metareview checkout to build.
+repo="$(cd -- "${2:-$PWD}" && pwd -P)"
+root="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd -- "$root"
+go build -o bin/metareview ./cmd/metareview
+
+# Each run gets its own reports, outside the repository being reviewed.
+output="$(mktemp -d "/tmp/metareview-${model}-XXXXXX")"
+printf 'Reports: %s\n' "$output" >&2
+exec "$root/bin/metareview" source-review --model "$model" --output "$output" "$repo"

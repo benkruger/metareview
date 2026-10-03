@@ -38,6 +38,30 @@ standalone or as a deeper review engine inside metaswarm, Superpowers, and Beads
 **→ New here? Read [USAGE.md](USAGE.md) for a task-oriented walkthrough, and [INSTALL.md](INSTALL.md) to
 get set up.**
 
+## Review a whole repository
+
+From a metareview source checkout, review a repository with Grok:
+
+```bash
+bin/source-review grok /path/to/repo
+```
+
+Replace `grok` with `opus` or `astra` to use another model. Omit the repository
+path to review your current directory. The script builds metareview automatically;
+you need Go and the selected model's CLI (`grok`, `claude`, or `codex`) installed
+and logged in.
+
+Each run saves `findings.json` and an offline `review.html` in its own directory
+under `/tmp`; the script prints that directory before starting. It reviews the
+committed first-party source at `HEAD`, skipping tests, docs, dependencies, and
+generated files.
+
+For path filters, concurrency, or timeout controls, use the full command:
+
+```bash
+bin/metareview source-review --model grok --output /tmp/grok-review --jobs 8 --call-timeout 30m /path/to/repo
+```
+
 ## Use Cases
 
 - **Workflow runs.** `metareview fsm` drives `sdlc-loop` (discover → adjudicate → fix → verify) and `review-loop` as an audited state machine: the agent does the host nodes' work in its own warm session, judge calls are auditable and swappable, and resume is a fork. Contract: `metareview fsm --agent-prompt`; guide: `docs/fsm/driving-a-workflow.md`.
