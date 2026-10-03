@@ -2,7 +2,6 @@ package epicready
 
 import (
 	"fmt"
-	"github.com/dsifry/metareview/internal/mutation"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,12 +17,15 @@ import (
 	"github.com/dsifry/metareview/internal/reviewers"
 	"github.com/dsifry/metareview/internal/reviewlog"
 	"github.com/dsifry/metareview/internal/reviewstate"
+	"github.com/dsifry/metareview/internal/rollback"
 	"github.com/dsifry/metareview/internal/runchain"
 	"github.com/dsifry/metareview/internal/state"
 	"github.com/dsifry/metareview/internal/tasksource"
 )
 
 type Options struct {
+	// Incremental marks a review whose Base is a last-reviewed checkpoint (#176); the run records the token.
+	Incremental   bool
 	Base          string
 	PreviousRunID string
 	EvidencePath  string
@@ -32,6 +34,8 @@ type Options struct {
 	// MutationReportPaths are --mutation-report files: a mutation-testing engine's output,
 	// either mutation-testing-report-schema or gremlins JSON. Empty is the ordinary case.
 	MutationReportPaths []string
+	// MutationViews are --mutation-view names (spec §11.3): the evidence is judged per view.
+	MutationViews []string
 }
 
 type Result struct {
@@ -54,6 +58,7 @@ type runRecord struct {
 	AttemptNumber        int                 `json:"attemptNumber"`
 	MaxAttempts          int                 `json:"maxAttempts"`
 	BaseSHA              string              `json:"baseSha"`
+	RequestedBase        string              `json:"requestedBase,omitempty"`
 	HeadSHA              string              `json:"headSha"`
 	ContextPath          string              `json:"contextPackPath"`
 	ReviewPath           string              `json:"reviewLogPath"`
@@ -72,11 +77,6 @@ type runRecord struct {
 	GitHead              string              `json:"gitHead"`
 }
 
-type fileSnapshot struct {
-	existed bool
-	content []byte
-}
-
 var reviewerNames = []string{"epic-integration-reviewer", "acceptance-reviewer", "intent-preservation-reviewer", "architecture-reviewer"}
 
 // Seams over the collaborator and stdlib calls whose error branches in Create are otherwise
@@ -85,7 +85,7 @@ var reviewerNames = []string{"epic-integration-reviewer", "acceptance-reviewer",
 var (
 	collectKnowledge   = knowledge.Collect
 	discoverLogs       = reviewlog.Discover
-	unresolvedBlocking = findings.UnresolvedBlocking
+	unresolvedBlocking = findings.UnresolvedBlockingAllBranches // child tasks are named explicitly: across branches (#178)
 	resolveChain       = runchain.Resolve
 	reconcileFindings  = findings.Reconcile
 	appendJSONL        = state.AppendJSONL
@@ -107,6 +107,9 @@ func Create(root, target string, options Options) (Result, error) {
 	git, err := gitcontext.CollectWithExcludesExcept(root, options.Base, generatedMetareviewPathExcludes(), exceptions)
 	if err != nil {
 		return Result{}, err
+	}
+	if options.Incremental {
+		git.RequestedBase = reviewstate.LastReviewedBase
 	}
 	reviewGit := git
 	if len(exceptions) == 0 {
@@ -138,16 +141,13 @@ func Create(root, target string, options Options) (Result, error) {
 	runsPath := filepath.Join(root, ".metareview", "runs.jsonl")
 	findingsPath := filepath.Join(root, ".metareview", "findings.jsonl")
 	findingsIndexPath := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
-	snapshots := map[string]fileSnapshot{}
-	for _, path := range []string{contextPath, reviewPath, runsPath, findingsPath, findingsIndexPath} {
-		snapshots[path] = snapshot(path)
-	}
+	snapshots := rollback.GateOutputs(contextPath, reviewPath, runsPath, findingsPath, findingsIndexPath)
 
 	gateEffect := "advisory"
 	if report.Capabilities.Beads || report.Capabilities.Metaswarm {
 		gateEffect = "gate"
 	}
-	mutationContext, err := mutationContextFor(options.MutationReportPaths)
+	mutationContext, err := mutationContextFor(root, options.MutationReportPaths, options.MutationViews)
 	if err != nil {
 		return Result{}, err
 	}
@@ -190,15 +190,18 @@ func Create(root, target string, options Options) (Result, error) {
 			previousRunIDs = append(previousRunIDs, link.ID)
 		}
 		reconciled, err := reconcileFindings(root, run, rawFindings, findings.Options{
-			PreviousRunID:  options.PreviousRunID,
-			PreviousRunIDs: previousRunIDs,
-			ResetRunIDs:    chain.ResetRunIDs,
+			PreviousRunID:    options.PreviousRunID,
+			PreviousRunIDs:   previousRunIDs,
+			ResetRunIDs:      chain.ResetRunIDs,
+			MutationEngines:  mutationContext.Engines(),
+			MutationViews:    mutationContext.Views,
+			MutationViewMaps: mutationContext.ViewMaps(),
 		})
 		if err != nil {
 			return err
 		}
 		counts := findings.CountByClass(reconciled.OpenFindings)
-		verdict, status, blocking, escalationReason := verdictForCounts(counts, gateEffect, chain.AttemptNumber, chain.MaxAttempts)
+		verdict, status, blocking, escalationReason := verdictForCounts(counts, gateEffect, chain.AttemptNumber, chain.MaxAttempts, findings.OnlyStaleBlockers(reconciled.OpenFindings))
 		result.Verdict = verdict
 		result.Blocking = blocking
 		record := runRecord{
@@ -213,6 +216,7 @@ func Create(root, target string, options Options) (Result, error) {
 			AttemptNumber:        chain.AttemptNumber,
 			MaxAttempts:          chain.MaxAttempts,
 			BaseSHA:              git.BaseSHA,
+			RequestedBase:        git.RequestedBase,
 			HeadSHA:              git.HeadSHA,
 			ContextPath:          contextRel,
 			ReviewPath:           reviewRel,
@@ -242,10 +246,10 @@ func Create(root, target string, options Options) (Result, error) {
 			FollowUpFindingCount: counts.FollowUp,
 			WarningFindingCount:  counts.Warnings,
 		}
-		return writeFile(reviewPath, []byte(reviewMarkdown(runID, target, contextRel, options.PreviousRunID, gateEffect, verdict, git.ChangedFiles, reconciled.OpenFindings, meta)), 0o644)
+		return writeFile(reviewPath, []byte(reviewMarkdown(runID, target, contextRel, options.PreviousRunID, gateEffect, verdict, git.ChangedFiles, reconciled.OpenFindings, mutationContext.FreshnessSection, meta)), 0o644)
 	}()
 	if err != nil {
-		restoreSnapshots(snapshots)
+		snapshots.Restore()
 		removeEmptyDirs(root)
 		return Result{}, err
 	}
@@ -266,7 +270,7 @@ func adversarialStatus(root string, git, reviewGit gitcontext.Context) reviewers
 		// default review-loop (task-done rubric) that would then be credited for epic-ready.
 		WorkflowHint: "epic-review-loop",
 	}
-	if ev, ok, err := reviewstate.LatestReviewEvidence(root, "epic-ready", git.BaseSHA, git.HeadSHA); err == nil && ok {
+	if ev, ok, err := reviewstate.CurrentReviewEvidence(root, "epic-ready", git.BaseSHA, git.HeadSHA, gitcontext.ChangedSince(root)); err == nil && ok {
 		status.Present = true
 		status.Verdict = ev.AdjudicatedVerdict
 		status.Emulated = ev.IsEmulated()
@@ -561,6 +565,7 @@ func contextMarkdown(runID string, epic epicsource.Source, children []tasksource
 		"## Children\n\n" + childrenMarkdown(children) + "\n\n" +
 		"## Git\n\n" +
 		"- Base: " + markdown.InlineCode(git.BaseSHA) + "\n" +
+		markdown.OptionalListItem("Requested base", git.RequestedBase) +
 		"- Head: " + markdown.InlineCode(git.HeadSHA) + "\n" +
 		"- Branch: " + markdown.InlineCode(git.Branch) + "\n" +
 		"- Gate effect: " + markdown.InlineCode(gateEffect) + "\n\n" +
@@ -621,11 +626,19 @@ type reviewMetadata struct {
 	WarningFindingCount  int
 }
 
-func verdictForCounts(counts findings.ClassCounts, gateEffect string, attemptNumber, maxAttempts int) (string, string, bool, string) {
+func verdictForCounts(counts findings.ClassCounts, gateEffect string, attemptNumber, maxAttempts int, staleOnly bool) (string, string, bool, string) {
 	blocking := counts.Blocking > 0
 	nonBlocking := counts.Advisory > 0 || counts.FollowUp > 0 || counts.Warnings > 0
 	if blocking && attemptNumber >= maxAttempts {
+		// Spec §6.8: a chain blocked only by stale mutation evidence waits for a refresh, up to
+		// 2 × maxAttempts, before it escalates.
+		if staleOnly && attemptNumber < 2*maxAttempts {
+			return "NEEDS_REVISION", "needs-revision", true, ""
+		}
 		reason := fmt.Sprintf("blocking findings remain after attempt %d of %d", attemptNumber, maxAttempts)
+		if staleOnly {
+			reason = fmt.Sprintf("stale mutation evidence not refreshed after %d attempts", attemptNumber)
+		}
 		return "ESCALATED", "escalated", true, reason
 	}
 	if blocking {
@@ -637,7 +650,10 @@ func verdictForCounts(counts findings.ClassCounts, gateEffect string, attemptNum
 	return "PASS", "passed", false, ""
 }
 
-func reviewMarkdown(runID, target, contextRel, previousRun, gateEffect, verdict string, coveredPaths []string, records []findings.Record, meta reviewMetadata) string {
+func reviewMarkdown(runID, target, contextRel, previousRun, gateEffect, verdict string, coveredPaths []string, records []findings.Record, freshnessSection string, meta reviewMetadata) string {
+	if freshnessSection != "" {
+		freshnessSection += "\n\n"
+	}
 	// Covered paths: the exclude-filtered source files this review examined, so `status` can credit a
 	// clean review for the files it read (see reviewlog.DecodeCoveredPaths / status coverage accounting).
 	return "# metareview: epic-ready review\n\n" +
@@ -648,94 +664,11 @@ func reviewMarkdown(runID, target, contextRel, previousRun, gateEffect, verdict 
 		"Gate effect: " + markdown.InlineCode(gateEffect) + "\n\n" +
 		"Previous run: " + markdown.InlineCode(firstNonEmpty(previousRun, "none")) + "\n\n" +
 		reviewlog.CoveredPathsLabel + " " + markdown.InlineCode(reviewlog.EncodeCoveredPaths(coveredPaths)) + "\n\n" +
-		"## Verdict\n\n" + verdict + "\n\n" +
+		"## Verdict\n\n" + verdict + "\n\n" + freshnessSection +
 		"## Reviewer Results\n\n| Reviewer | Verdict | Blocking | Notes |\n| --- | --- | ---: | --- |\n" +
-		reviewerTable(records) + "\n\n" +
-		findingsMarkdown(records) + "\n" +
+		findings.ReviewerTable(reviewerNames, records) + "\n\n" +
+		findings.ClassifiedMarkdown(records, runID) + "\n" +
 		runChainMarkdown(runID, verdict, meta)
-}
-
-func reviewerTable(records []findings.Record) string {
-	lines := make([]string, 0, len(reviewerNames))
-	for _, reviewer := range reviewerNames {
-		var blockers, nonBlockers []string
-		for _, record := range records {
-			if record.Reviewer != reviewer {
-				continue
-			}
-			counts := findings.CountByClass([]findings.Record{record})
-			if counts.Blocking > 0 {
-				blockers = append(blockers, record.Title)
-			} else {
-				nonBlockers = append(nonBlockers, record.Title)
-			}
-		}
-		verdict := "PASS"
-		note := "No blocking findings."
-		if len(blockers) > 0 {
-			verdict = "NEEDS_REVISION"
-			note = strings.Join(blockers, "; ")
-		} else if len(nonBlockers) > 0 {
-			verdict = "PASS_ADVISORY"
-			note = strings.Join(nonBlockers, "; ")
-		}
-		lines = append(lines, fmt.Sprintf("| %s | %s | %d | %s |", reviewer, verdict, len(blockers), note))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func findingsMarkdown(records []findings.Record) string {
-	return classifiedFindingsMarkdown(records)
-}
-
-func classifiedFindingsMarkdown(records []findings.Record) string {
-	sections := []struct {
-		title string
-		label string
-	}{
-		{title: "## Blocking Findings", label: "blocking"},
-		{title: "## Advisory Findings", label: "advisory"},
-		{title: "## Follow-up Findings", label: "follow-up"},
-		{title: "## Warnings", label: "warning"},
-	}
-	var output []string
-	for _, section := range sections {
-		var items []string
-		for _, record := range records {
-			if classForDisplay(record) != section.label {
-				continue
-			}
-			items = append(items, "### "+record.ID+": "+record.Title+"\n\n"+
-				"- Reviewer: "+record.Reviewer+"\n"+
-				"- Severity: "+record.Severity+"\n"+
-				"- Classification: "+record.Classification+"\n"+
-				"- Finding: "+record.Finding+"\n"+
-				"- Expected: "+record.Expected+"\n"+
-				"- Found: "+record.Found+"\n"+
-				"- Recommendation: "+record.Recommendation+"\n")
-		}
-		body := "No findings in this class.\n"
-		if len(items) > 0 {
-			body = strings.Join(items, "\n")
-		}
-		output = append(output, section.title+"\n\n"+body)
-	}
-	return strings.Join(output, "\n\n")
-}
-
-func classForDisplay(record findings.Record) string {
-	counts := findings.CountByClass([]findings.Record{record})
-	// if/else-if rather than a tagless switch: Go's cover profile emits no counter for a
-	// tagless-switch case expression, so the boundary mutants on these comparisons would be reported
-	// not-covered and stay unkillable. See the #104/#106 precedent.
-	if counts.Blocking > 0 {
-		return "blocking"
-	} else if counts.Advisory > 0 {
-		return "advisory"
-	} else if counts.FollowUp > 0 {
-		return "follow-up"
-	}
-	return "warning"
 }
 
 func runChainMarkdown(runID, verdict string, meta reviewMetadata) string {
@@ -751,25 +684,6 @@ func runChainMarkdown(runID, verdict string, meta reviewMetadata) string {
 	builder.WriteString("\n## Unresolved Blocker Summary\n\n")
 	fmt.Fprintf(&builder, "- Blocking: %d\n- Advisory: %d\n- Follow-up: %d\n- Warnings: %d\n", meta.BlockingFindingCount, meta.AdvisoryFindingCount, meta.FollowUpFindingCount, meta.WarningFindingCount)
 	return builder.String()
-}
-
-func snapshot(path string) fileSnapshot {
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		return fileSnapshot{existed: false}
-	}
-	return fileSnapshot{existed: true, content: bytes}
-}
-
-func restoreSnapshots(snapshots map[string]fileSnapshot) {
-	for path, snapshot := range snapshots {
-		if snapshot.existed {
-			_ = os.MkdirAll(filepath.Dir(path), 0o755)
-			_ = os.WriteFile(path, snapshot.content, 0o644)
-			continue
-		}
-		_ = os.Remove(path)
-	}
 }
 
 func removeEmptyDirs(root string) {
@@ -844,13 +758,6 @@ func firstNonEmpty(values ...string) string {
 // mutationContextFor loads the declared mutation reports. An unreadable or unrecognised report is
 // an error that stops the review, never a skipped file: a mutation gate that quietly drops a
 // report is a gate that passes because it looked at less.
-func mutationContextFor(paths []string) (reviewers.MutationContext, error) {
-	if len(paths) == 0 {
-		return reviewers.MutationContext{}, nil
-	}
-	reports, err := mutation.LoadAll(paths)
-	if err != nil {
-		return reviewers.MutationContext{}, err
-	}
-	return reviewers.MutationContext{Reports: reports}, nil
+func mutationContextFor(root string, paths, views []string) (reviewers.MutationContext, error) {
+	return reviewers.LoadMutationContext(root, paths, views, "epic-ready", false)
 }

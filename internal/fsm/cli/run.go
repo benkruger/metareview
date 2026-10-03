@@ -23,6 +23,7 @@ import (
 	"github.com/dsifry/metareview/internal/fsm/mockai"
 	"github.com/dsifry/metareview/internal/fsm/run"
 	"github.com/dsifry/metareview/internal/fsm/workflow"
+	"github.com/dsifry/metareview/internal/scope"
 	"github.com/dsifry/metareview/workflows"
 )
 
@@ -113,7 +114,7 @@ func parseArgs(args []string) (*parsed, error) {
 				return nil, fmt.Errorf("--var expects K=V, got %q", v)
 			}
 			p.vars[k] = val
-		case "--workflow", "--base", "--goldens", "--repo-mode", "--allow-custom-cmds", "--mock-ai", "--work-dir", "--run-id", "--run", "--from", "--at-iter", "--node", "--data", "--input", "--kind", "--model", "--effort", "--context", "--check", "--a", "--b", "--out", "--max-bytes", "--judge-model", "--judge-effort":
+		case "--workflow", "--base", "--for-branch", "--goldens", "--repo-mode", "--allow-custom-cmds", "--mock-ai", "--work-dir", "--run-id", "--run", "--from", "--at-iter", "--node", "--data", "--input", "--kind", "--model", "--effort", "--context", "--check", "--a", "--b", "--out", "--max-bytes", "--judge-model", "--judge-effort":
 			p.flags[strings.TrimPrefix(a, "--")] = v
 		default:
 			return nil, fmt.Errorf("unknown option %s", a)
@@ -194,11 +195,12 @@ type opened struct {
 func (in *invocation) openRun(mode judgeMode, readOnly, repair bool) (*opened, envelope, int, bool) {
 	c := in.c
 	base := envelope{}
-	root, err := c.rootOf()
+	root, common, warns, err := c.roots()
 	if err != nil {
 		return nil, base, in.fail(base, err, phaseOpen, false), false
 	}
-	store := c.deps.Store(root)
+	in.warns = append(in.warns, warns...)
+	store := c.deps.Store(common)
 	id, fromEnv, err := c.resolveRun(store, in.p.flags["run"])
 	if err != nil {
 		return nil, base, in.fail(base, err, phaseOpen, false), false
@@ -210,12 +212,12 @@ func (in *invocation) openRun(mode judgeMode, readOnly, repair bool) (*opened, e
 	if in.p.has("mock-ai") {
 		return nil, base, in.usage("--mock-ai is an init flag; later commands read the scenario from the run"), false
 	}
-	init, _ := c.peek(root, id)
+	init, _ := c.peek(common, id)
 	scenario, err := c.scenarioFor(root, init)
 	if err != nil {
 		return nil, base, in.fail(base, err, phaseOpen, false), false
 	}
-	md, err := c.machineDeps(root, scenario, mode)
+	md, err := c.machineDeps(root, common, scenario, mode)
 	if err != nil {
 		return nil, base, in.fail(base, err, phaseOpen, false), false
 	}
@@ -253,15 +255,71 @@ func (in *invocation) init() int {
 	if !p.has("workflow") {
 		return in.usage("--workflow is required")
 	}
-	root, err := c.rootOf()
+	root, common, warns, err := c.roots()
 	if err != nil {
 		return in.fail(base, err, phaseInit, false)
 	}
+	in.warns = append(in.warns, warns...)
 	workDir := in.abs(p.flags["work-dir"])
 	if workDir == "" {
-		if workDir, err = c.toplevel(); err != nil {
+		if workDir, err = c.workRoot(); err != nil {
 			return in.fail(base, err, phaseInit, false)
 		}
+	}
+	// The branch the run is for (#177): status scopes abandoned runs by it. A detached HEAD (a review snapshot) must
+	// name it — every run has an owning branch, so a rebase can never silently clear a detached run's gate. On a branch,
+	// --for-branch may only restate it: naming another would file this branch's run under that one, and an abandoned
+	// run would stop blocking the branch it actually reviewed.
+	branch, current := p.flags["for-branch"], ""
+	// The full refname: git's --short form reads "heads/feat" once a tag shares the name, which status would never
+	// match (internal/scope compares full refnames too).
+	gitFailed := func(op string, code int, err error) int {
+		detail := fmt.Sprintf("git %s exited %d", op, code)
+		if err != nil {
+			detail = fmt.Sprintf("git %s: %v", op, err)
+		}
+		return in.fail(base, errs.E(gate.CodeGit, detail, "op", op), phaseInit, false)
+	}
+	out, code, err := c.git(workDir, "symbolic-ref", "-q", "HEAD")
+	switch {
+	case err == nil && code == 0:
+		current = scope.BranchName(out)
+	case err != nil || code != 1: // 1 is git's "detached"; anything else is git failing, not a detached HEAD
+		return gitFailed("symbolic-ref", code, err)
+	}
+	// The branches exactly as git lists them: a name no local branch has would never match the name leg, so after a
+	// rebase the run would be orphaned and block nothing. A case-insensitive filesystem lets `git checkout Feat` land
+	// on feat with HEAD spelled Feat, and resolves refs/heads/FEAT to feat — status compares exactly, so the checked-out
+	// name is recorded as git lists it, and --for-branch must be spelled that way.
+	refs, code, err := c.git(workDir, "for-each-ref", "--format=%(refname)", "refs/heads")
+	if err != nil || code != 0 {
+		return gitFailed("for-each-ref", code, err)
+	}
+	branches := map[string]bool{}
+	for _, ref := range strings.Fields(refs) {
+		branches[scope.BranchName(ref)] = true
+	}
+	if current != "" && !branches[current] {
+		// Folded only when git resolves that spelling (a case-insensitive filesystem): on a case-sensitive one it is
+		// an unborn branch of its own.
+		switch _, code, err := c.git(workDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+current); {
+		case err == nil && code == 0:
+			current = scope.Canonical(current, branches)
+		case err != nil || code != 1: // git's "no" is 1; anything else is git failing, as status treats it
+			return gitFailed("rev-parse", code, err)
+		}
+	}
+	if branch != "" && current == "" && !branches[branch] {
+		return in.usage("--for-branch " + strconv.Quote(branch) + " is not a local branch in " + workDir)
+	}
+	if current != "" && branch != "" && scope.Canonical(branch, branches) != current {
+		return in.usage("--for-branch " + branch + " names another branch than the one checked out in " + workDir + " (" + current + "); it is for a detached HEAD")
+	}
+	if current != "" {
+		branch = current // restated or not, the checked-out branch as git lists it
+	}
+	if branch == "" {
+		return in.usage("HEAD is detached in " + workDir + ": pass --for-branch <branch> to name the branch this run reviews for")
 	}
 	mockDir := p.flags["mock-ai"]
 	if mockDir == "" {
@@ -280,12 +338,12 @@ func (in *invocation) init() int {
 			return in.fail(base, err, phaseInit, false)
 		}
 	}
-	md, err := c.machineDeps(root, scenario, judgeReal)
+	md, err := c.machineDeps(root, common, scenario, judgeReal)
 	if err != nil {
 		return in.fail(base, err, phaseInit, false)
 	}
 	if id := p.flags["run-id"]; id != "" {
-		exists, err := c.deps.Exists(root, id)
+		exists, err := c.deps.Exists(common, id)
 		if err != nil {
 			return in.fail(base, err, phaseInit, false)
 		}
@@ -308,7 +366,7 @@ func (in *invocation) init() int {
 	// call time, so the model that judged a run is visible in its snapshot and
 	// its export. An override the audit cannot see would be worse than none.
 	vars := c.applyJudgeOverrideFor(p.vars, p.flags["judge-model"], p.flags["judge-effort"], p.bools["calibration"])
-	opts := machine.InitOptions{Workflow: wf, RunID: p.flags["run-id"], Vars: vars, Base: p.flags["base"], RepoMode: p.flags["repo-mode"], AllowCustomCmds: p.flags["allow-custom-cmds"], Calibration: p.bools["calibration"], MockDir: mockDir, GoldensPath: goldens, WorkDir: workDir, RepoRoot: root}
+	opts := machine.InitOptions{Workflow: wf, RunID: p.flags["run-id"], Vars: vars, Base: p.flags["base"], RepoMode: p.flags["repo-mode"], AllowCustomCmds: p.flags["allow-custom-cmds"], Calibration: p.bools["calibration"], MockDir: mockDir, GoldensPath: goldens, WorkDir: workDir, RepoRoot: root, Branch: branch}
 	m, err := machine.Init(c.ctx, md, opts)
 	if err != nil {
 		if errs.Is(err, machine.CodeCmdsNotAllowed) {
@@ -330,9 +388,6 @@ func (in *invocation) init() int {
 	env := envelope{}
 	viewKeys(env, v)
 	in.warns = append(in.warns, in.warnEvents(md.Store, v.RunID)...)
-	if !c.runsIgnored(workDir) {
-		in.warns = append(in.warns, WarnRunsNotIgnored+": .metareview/runs.jsonl is not ignored in "+workDir)
-	}
 	names := []string{}
 	for _, a := range v.Snapshot.AllowedCmds {
 		names = append(names, a.Name)
@@ -891,11 +946,12 @@ func (in *invocation) diff() int {
 		return in.usage("diff needs --a <run> --b <run>")
 	}
 	c := in.c
-	root, err := c.rootOf()
+	_, common, warns, err := c.roots()
 	if err != nil {
 		return in.fail(envelope{}, err, phaseNone, false)
 	}
-	store := c.deps.Store(root)
+	in.warns = append(in.warns, warns...)
+	store := c.deps.Store(common)
 	logs := [2]run.Log{}
 	for i, id := range []string{p.flags["a"], p.flags["b"]} {
 		if err := run.ValidateRunID(id); err != nil {
@@ -937,13 +993,24 @@ func (in *invocation) export() int {
 	}
 	env := base
 	viewKeys(env, o.m.View())
-	m, err := export.Export(in.c.ctx, in.c.exportDeps(o.root, o.md), o.id, opts)
+	work, err := in.c.workRoot()
+	if err != nil {
+		// Fall back to the store root only when there is genuinely no work tree around cwd (cwd inside .git).
+		// Any other failure inside a real worktree is returned: falling back there would silently write the
+		// bundle to the main checkout, which is the bug this root split fixes (#172).
+		if !in.c.outsideWorkTree() {
+			return in.fail(env, err, phaseNone, false)
+		}
+		work = o.root
+	}
+	deps := in.c.exportDeps(o.root, work, o.md)
+	m, err := export.Export(in.c.ctx, deps, o.id, opts)
 	if err != nil {
 		return in.fail(env, err, phaseNone, false)
 	}
 	out := opts.Out
 	if out == "" {
-		out = filepath.Join(o.root, "docs", "metareview", "fsm", o.id)
+		out = export.DefaultOut(deps, o.id)
 	}
 	env["manifest"], env["out"], env["untrusted"] = m, out, []string{}
 	return in.ok(env, StatusOK, 0)
@@ -952,17 +1019,25 @@ func (in *invocation) export() int {
 // StatusLines renders the `metareview status` FSM section (spec 5 §6): read-only over Store.List() at the main root.
 func StatusLines(ctx context.Context, deps Deps, cwd string) []string {
 	c := &ctxDeps{ctx: ctx, deps: deps, cwd: cwd}
-	root, err := c.rootOf()
+	common, err := c.commonDir()
 	if err != nil {
 		return nil
 	}
-	list, err := deps.Store(root).List()
+	// status is read-only, so it never migrates: after an upgrade it names the 0.13.x runs still waiting instead.
+	var pending []string
+	if root, err := c.storeRoot(); err == nil {
+		if ids := run.PendingLegacyRuns(root, common); len(ids) > 0 {
+			pending = []string{fmt.Sprintf("fsm runs: %d 0.13.x run(s) not yet migrated in %s; any `metareview fsm` command migrates them",
+				len(ids), filepath.Join(root, ".metareview", "runs"))} // root: store (the 0.13.x location)
+		}
+	}
+	list, err := deps.Store(common).List()
 	if err != nil {
 		code, _, _ := failure(err)
-		return []string{"fsm runs: " + code}
+		return append([]string{"fsm runs: " + code}, pending...)
 	}
 	if len(list) == 0 {
-		return []string{"fsm runs: none"}
+		return append([]string{"fsm runs: none"}, pending...)
 	}
 	var good, bad []string
 	for _, s := range list {
@@ -986,5 +1061,5 @@ func StatusLines(ctx context.Context, deps Deps, cwd string) []string {
 		good = append(good, fmt.Sprintf("%s  %s  %s%s", s.RunID, s.State, outcome, mock))
 	}
 	sort.Strings(bad)
-	return append(append([]string{"fsm runs:"}, good...), bad...)
+	return append(append(append([]string{"fsm runs:"}, good...), bad...), pending...)
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -340,7 +341,7 @@ func TestRunOverride(t *testing.T) {
 		t.Errorf("list unknown: code=%d e=%q", code, e)
 	}
 	// request missing id.
-	if code, _, e := runCLI(t, root, nil, "override", "request"); code != 2 || !strings.Contains(e, "override request <finding-id>") {
+	if code, _, e := runCLI(t, root, nil, "override", "request"); code != 2 || !strings.Contains(e, "override request <finding-id|run-id>") {
 		t.Errorf("request missing id: code=%d e=%q", code, e)
 	}
 	// unknown subcommand.
@@ -442,38 +443,131 @@ func TestValidateFromRunDiff(t *testing.T) {
 	}
 
 	// Missing run dir.
-	if err := validateFromRunDiff(root, "ghost", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "no such FSM run") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "ghost", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "no such FSM run in the store") {
 		t.Errorf("missing run: %v", err)
 	}
 	// Malformed event line.
 	writeAudit("bad", "{not json")
-	if err := validateFromRunDiff(root, "bad", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "malformed event") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "bad", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "malformed event") {
 		t.Errorf("malformed: %v", err)
 	}
 	// First event not init.
 	writeAudit("noinit", transition(fsmrun.OutcomeReviewed))
-	if err := validateFromRunDiff(root, "noinit", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "does not start with a valid init") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "noinit", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "does not start with a valid init") {
 		t.Errorf("no init: %v", err)
 	}
 	// Diff mismatch.
 	writeAudit("mismatch", initEvent("other", "head2", ""), transition(fsmrun.OutcomeReviewed))
-	if err := validateFromRunDiff(root, "mismatch", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "different diff") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "mismatch", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "different diff") {
 		t.Errorf("mismatch: %v", err)
 	}
 	// Wrong workflow.
 	writeAudit("wf", initEvent("b", "h", "review-loop"), transition(fsmrun.OutcomeReviewed))
-	if err := validateFromRunDiff(root, "wf", "b", "h", "epic-review-loop"); err == nil || !strings.Contains(err.Error(), "requires") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "wf", "b", "h", "epic-review-loop"); err == nil || !strings.Contains(err.Error(), "requires") {
 		t.Errorf("workflow: %v", err)
 	}
 	// Non-passing final outcome.
 	writeAudit("failed", initEvent("b", "h", ""), transition(fsmrun.OutcomeReviewed), transition(fsmrun.Outcome("failed")))
-	if err := validateFromRunDiff(root, "failed", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "not a passing review") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "failed", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "not a passing review") {
 		t.Errorf("failed: %v", err)
 	}
 	// Passing.
 	writeAudit("ok", initEvent("b", "h", ""), transition(fsmrun.OutcomeReviewed))
-	if err := validateFromRunDiff(root, "ok", "b", "h", ""); err != nil {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "ok", "b", "h", ""); err != nil {
 		t.Errorf("passing: %v", err)
+	}
+
+	// mr-1ad: a fix loop that ends with a fresh review passing at the head it committed backs a marker for THAT head
+	// (the review ran there), not only its init head; a run whose last pass was a fix it did not re-review does not.
+	transitionAt := func(outcome fsmrun.Outcome, head string) string {
+		d, _ := json.Marshal(fsmrun.TransitionData{Outcome: outcome, Head: head})
+		e, _ := json.Marshal(fsmrun.Event{Type: fsmrun.TypeTransition, Data: d})
+		return string(e)
+	}
+	runs := filepath.Join(root, ".metareview", "runs")
+	needsInput := func(node, head string) string {
+		d, _ := json.Marshal(fsmrun.NeedsInputData{Head: head})
+		e, _ := json.Marshal(fsmrun.Event{Type: fsmrun.TypeNeedsInput, Node: node, Data: d})
+		return string(e)
+	}
+	nodeOutput := func(node string) string {
+		e, _ := json.Marshal(fsmrun.Event{Type: fsmrun.TypeNodeOutput, Node: node, Data: json.RawMessage(`{}`)})
+		return string(e)
+	}
+	writeWorkflow := func(runID string) {
+		t.Helper()
+		yml := "nodes:\n  discover: {kind: review-lenses}\n  adjudicate: {kind: match-then-adjudicate}\n  fix: {kind: agent-edit}\n  recheck: {kind: review-lenses}\n"
+		if err := os.WriteFile(filepath.Join(runs, runID, "workflow.yaml"), []byte(yml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeAudit("loop-clean", initEvent("b", "h0", "sdlc-loop-clean"), needsInput("discover", "h0"), transitionAt("", "h0"),
+		needsInput("fix", "h0"), transitionAt("", "h1"), needsInput("recheck", "h1"), transitionAt("", "h1"),
+		needsInput("discover", "h2"), nodeOutput("discover"), transitionAt("", "h2"), needsInput("adjudicate", "h2"), transitionAt(fsmrun.OutcomeClean, "h2"))
+	writeWorkflow("loop-clean")
+	if err := validateFromRunDiff(runs, "loop-clean", "b", "h2", ""); err != nil {
+		t.Errorf("a clean review at the final head must back it: %v", err)
+	}
+	if err := validateFromRunDiff(runs, "loop-clean", "b", "h1", ""); err == nil || !strings.Contains(err.Error(), "different diff") {
+		t.Errorf("an intermediate head was never reviewed clean: %v", err)
+	}
+	if err := validateFromRunDiff(runs, "loop-clean", "other", "h2", ""); err == nil || !strings.Contains(err.Error(), "different diff") {
+		t.Errorf("the base still has to match: %v", err)
+	}
+	writeAudit("loop-fixed", initEvent("b", "h0", "sdlc-loop"), transitionAt(fsmrun.OutcomeFixed, "h3"))
+	if err := validateFromRunDiff(runs, "loop-fixed", "b", "h3", ""); err == nil || !strings.Contains(err.Error(), "different diff") {
+		t.Errorf("a fix verified but never re-reviewed must not back its head: %v", err)
+	}
+	writeAudit("loop-reviewed", initEvent("b", "h0", "sdlc-loop-clean"), needsInput("recheck", "h4"), transitionAt(fsmrun.OutcomeReviewed, "h4"))
+	writeWorkflow("loop-reviewed")
+	if err := validateFromRunDiff(runs, "loop-reviewed", "b", "h4", ""); err != nil {
+		t.Errorf("an adjudicated review at the final head backs it: %v", err)
+	}
+	if err := validateFromRunDiff(runs, "loop-reviewed", "b", "h4", "epic-review-loop"); err == nil || !strings.Contains(err.Error(), "requires") {
+		t.Errorf("the workflow constraint still applies to a final-head match: %v", err)
+	}
+	// The head a transition stamps is git's HEAD when it fires, not what the lenses saw: a commit made after the last
+	// review (discover at h5, commit h6, adjudicate -> done) must not be laundered into a marker for h6.
+	writeAudit("laundered", initEvent("b", "h0", "review-loop"), needsInput("discover", "h5"), transitionAt("", "h5"),
+		transitionAt(fsmrun.OutcomeClean, "h6"))
+	writeWorkflow("laundered")
+	if err := validateFromRunDiff(runs, "laundered", "b", "h6", ""); err == nil || !strings.Contains(err.Error(), "different diff") {
+		t.Errorf("a head the lenses never reviewed must not be accepted: %v", err)
+	}
+	writeAudit("moved-after", initEvent("b", "h0", "review-loop"), needsInput("discover", "h7"), transitionAt("", "h8"),
+		transitionAt(fsmrun.OutcomeClean, "h7"))
+	writeWorkflow("moved-after")
+	if err := validateFromRunDiff(runs, "moved-after", "b", "h7", ""); err == nil {
+		t.Error("a head that moved between the last review and the ending is not accepted")
+	}
+	// A driver may record a review node's output without asking for it first (at an unchanged head): the review is
+	// taken at the head the run last recorded — real sdlc-loop-clean runs do this.
+	writeAudit("output-only", initEvent("b", "h0", "sdlc-loop-clean"), needsInput("fix", "h0"), transitionAt("", "h11"),
+		nodeOutput("recheck"), transitionAt("", "h11"), nodeOutput("discover"), transitionAt(fsmrun.OutcomeClean, "h11"))
+	writeWorkflow("output-only")
+	if err := validateFromRunDiff(runs, "output-only", "b", "h11", ""); err != nil {
+		t.Errorf("a review recorded without needs_input at the final head backs it: %v", err)
+	}
+	// The review's own head decides even when the ending transition sits at the wanted head: reviewed h12, ended h13.
+	writeAudit("review-elsewhere", initEvent("b", "h0", "review-loop"), needsInput("discover", "h12"), transitionAt(fsmrun.OutcomeClean, "h13"))
+	writeWorkflow("review-elsewhere")
+	if err := validateFromRunDiff(runs, "review-elsewhere", "b", "h13", ""); err == nil {
+		t.Error("a final head the last review was not at is not accepted")
+	}
+	writeAudit("no-workflow", initEvent("b", "h0", "review-loop"), needsInput("discover", "h9"), transitionAt(fsmrun.OutcomeClean, "h9"))
+	if err := validateFromRunDiff(runs, "no-workflow", "b", "h9", ""); err == nil {
+		t.Error("without its workflow a run cannot show which node reviewed the final head")
+	}
+	if err := os.WriteFile(filepath.Join(runs, "no-workflow", "workflow.yaml"), []byte("nodes: [unclosed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateFromRunDiff(runs, "no-workflow", "b", "h9", ""); err == nil {
+		t.Error("an unreadable workflow cannot show it either")
+	}
+	writeAudit("no-review", initEvent("b", "h0", "review-loop"), needsInput("fix", "h10"), transitionAt(fsmrun.OutcomeClean, "h10"))
+	writeWorkflow("no-review")
+	if err := validateFromRunDiff(runs, "no-review", "b", "h10", ""); err == nil {
+		t.Error("a run whose lenses never ran after init cannot back a later head")
 	}
 }
 
@@ -909,7 +1003,8 @@ func writeFSMRun(t *testing.T, root, runID, base, head, workflow string) {
 	initE, _ := json.Marshal(fsmrun.Event{Type: fsmrun.TypeInit, Data: initD})
 	trD, _ := json.Marshal(fsmrun.TransitionData{Outcome: fsmrun.OutcomeReviewed})
 	trE, _ := json.Marshal(fsmrun.Event{Type: fsmrun.TypeTransition, Data: trD})
-	p := filepath.Join(root, ".metareview", "runs", runID, "audit.jsonl")
+	// The shared store the FSM writes runs to: git's common directory (#173). root is the repository's main checkout.
+	p := filepath.Join(root, ".git", "metareview", "runs", runID, "audit.jsonl")
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -987,7 +1082,7 @@ func TestValidateFromRunDiffUnreadableTransition(t *testing.T) {
 	p := filepath.Join(root, ".metareview", "runs", "badtr", "audit.jsonl")
 	must(t, os.MkdirAll(filepath.Dir(p), 0o755))
 	must(t, os.WriteFile(p, []byte(string(initE)+"\n"+string(badTr)+"\n"), 0o644))
-	if err := validateFromRunDiff(root, "badtr", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "unreadable transition") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "badtr", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "unreadable transition") {
 		t.Fatalf("expected unreadable-transition error, got %v", err)
 	}
 }
@@ -1131,7 +1226,7 @@ func TestValidateFromRunDiffUnreadableInit(t *testing.T) {
 	p := filepath.Join(root, ".metareview", "runs", "badinit", "audit.jsonl")
 	must(t, os.MkdirAll(filepath.Dir(p), 0o755))
 	must(t, os.WriteFile(p, []byte(string(badInit)+"\n"), 0o644))
-	if err := validateFromRunDiff(root, "badinit", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "init event is unreadable") {
+	if err := validateFromRunDiff(filepath.Join(root, ".metareview", "runs"), "badinit", "b", "h", ""); err == nil || !strings.Contains(err.Error(), "init event is unreadable") {
 		t.Fatalf("expected unreadable-init error, got %v", err)
 	}
 }
@@ -1163,6 +1258,80 @@ func TestOverrideRequestUnknownOption(t *testing.T) {
 	}
 }
 
+// #188: an override on an ID nothing knows — no ledger row, no committed review log — fails loudly, so a script or CI
+// step that runs it never reads the refusal as success.
+func TestOverrideUnknownFindingExitsNonzero(t *testing.T) {
+	root := gitRepo(t)
+	for _, verb := range []string{"request", "grant"} {
+		code, _, e := runCLI(t, root, nil, "override", verb, "mrvf-nope-001", "--reason", "a reason long enough to record", "--by", "someone")
+		if code != 1 || !strings.Contains(e, "mrvf-nope-001 not found") {
+			t.Fatalf("override %s unknown id: code=%d e=%q", verb, code, e)
+		}
+	}
+}
+
+// #179 end to end: `override request|grant <run-id>` closes an abandoned FSM run. The request keeps `status` blocked, the
+// requester's grant is refused, and another actor's grant clears it; `status --all` lists it as closed.
+func TestOverrideClosesAnAbandonedRun(t *testing.T) {
+	root := gitRepo(t)
+	dir := filepath.Join(root, ".git", "metareview", "runs", "mrv-20260929-000000000000000-fsm-t-1")
+	must(t, os.MkdirAll(dir, 0o700))
+	must(t, os.WriteFile(filepath.Join(dir, "workflow.yaml"), []byte("workflow: t\nversion: 1\nvars: {}\nstates: [discover, fix, done, failed]\n"+
+		"transitions:\n  - {from: discover, to: fix, gate: findings_nonempty}\n  - {from: fix, to: done, gate: commit_exists, outcome: fixed}\n"+
+		"nodes:\n  discover: {kind: review-lenses, exec: subagent, lenses: 2}\n  fix: {kind: agent-edit}\nconvergence:\n  any: [{max_iterations: 2}]\n"), 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "audit.jsonl"), []byte(`{"type":"init","at":"2026-09-29T00:00:00Z","state":"discover","data":{"workflow":"t"}}`+"\n"+
+		`{"type":"transition","at":"2026-09-29T00:00:01Z","state":"discover","data":{"to":"fix","to_kind":"agent-edit"}}`+"\n"), 0o600))
+	id := "mrv-20260929-000000000000000-fsm-t-1"
+	blocked := func() bool {
+		t.Helper()
+		code, out, _ := runCLI(t, root, nil, "status", "--json", "--all")
+		return code != 0 && strings.Contains(out, `"runId": "`+id+`"`) && strings.Contains(out, `"abandoned"`)
+	}
+	if !blocked() {
+		t.Fatal("the abandoned run blocks status")
+	}
+	if code, _, e := runCLI(t, root, nil, "override", "request", id, "--by", "claude-agent", "--reason", "nobody will finish this run"); code != 0 {
+		t.Fatalf("request: %d %s", code, e)
+	}
+	if !blocked() {
+		t.Fatal("a request alone does not clear the run")
+	}
+	if _, plain, _ := runCLI(t, root, nil, "status"); !strings.Contains(plain, id+"  t @ fix  (close requested by claude-agent)") {
+		t.Fatalf("plain status names who asked:\n%s", plain)
+	}
+	if code, _, e := runCLI(t, root, nil, "override", "grant", id, "--by", "claude-agent", "--reason", "granting my own request"); code != 1 || !strings.Contains(e, "cannot also grant") {
+		t.Fatalf("self-grant: %d %s", code, e)
+	}
+	if code, _, e := runCLI(t, root, nil, "override", "grant", id, "--by", "maintainer", "--reason", "accepted: abandoned for good"); code != 0 {
+		t.Fatalf("grant: %d %s", code, e)
+	}
+	code, out, _ := runCLI(t, root, nil, "status", "--json", "--all")
+	if code != 0 || !strings.Contains(out, `"closedBy": "maintainer"`) || !strings.Contains(out, `"closeReason": "accepted: abandoned for good"`) {
+		t.Fatalf("status after the grant: %d %s", code, out)
+	}
+	// Text: a closed run is counted as closed, never as abandoned elsewhere, and --all names who closed it and why; a
+	// pending request on a run elsewhere names who asked.
+	other := filepath.Join(root, ".git", "metareview", "runs", "mrv-20260929-000000000000000-fsm-t-2")
+	must(t, os.MkdirAll(other, 0o700))
+	yaml, err := os.ReadFile(filepath.Join(dir, "workflow.yaml"))
+	must(t, err)
+	must(t, os.WriteFile(filepath.Join(other, "workflow.yaml"), yaml, 0o600))
+	must(t, os.WriteFile(filepath.Join(other, "audit.jsonl"), []byte(`{"type":"init","at":"2026-09-29T00:00:00Z","state":"discover","data":{"workflow":"t","branch":"gone","head":"0000000000000000000000000000000000000000"}}`+"\n"+
+		`{"type":"transition","at":"2026-09-29T00:00:01Z","state":"discover","data":{"to":"fix","to_kind":"agent-edit"}}`+"\n"), 0o600))
+	if code, _, e := runCLI(t, root, nil, "override", "request", "mrv-20260929-000000000000000-fsm-t-2", "--by", "claude-agent", "--reason", "an orphaned run nobody will finish"); code != 0 {
+		t.Fatalf("request elsewhere: %d %s", code, e)
+	}
+	_, plain, _ := runCLI(t, root, nil, "status")
+	if !strings.Contains(plain, "closed runs: 1 (metareview status --all lists them)") || !strings.Contains(plain, "abandoned runs elsewhere: 1 (") {
+		t.Fatalf("plain status counts the closed run apart:\n%s", plain)
+	}
+	_, all, _ := runCLI(t, root, nil, "status", "--all")
+	if !strings.Contains(all, "[closed]") || !strings.Contains(all, "closed by maintainer at ") || !strings.Contains(all, ": accepted: abandoned for good") ||
+		!strings.Contains(all, "[orphaned]") || !strings.Contains(all, "(close requested by claude-agent)") {
+		t.Fatalf("status --all names who closed a run and why, and who asked:\n%s", all)
+	}
+}
+
 // After a passing pr-ready review over the branch, branch-scoped status --json has nothing to clear
 // and exits 0, covering the clean-return in the branch-scope path.
 func TestStatusJSONBranchClean(t *testing.T) {
@@ -1184,5 +1353,219 @@ func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// writeRawFSMRun writes an audit.jsonl from ready-made events, for runs writeFSMRun cannot express.
+func writeRawFSMRun(t *testing.T, root, runID string, events ...fsmrun.Event) {
+	t.Helper()
+	var b strings.Builder
+	for _, ev := range events {
+		line, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	p := filepath.Join(root, ".metareview", "runs", runID, "audit.jsonl")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRecordLensesRejectsMockRuns (#185): a mock run is test infrastructure, never evidence. Neither a run whose
+// init names a mock scenario nor a real run carrying a mock-stamped event may back a subagent-adjudicated marker,
+// even over the right diff with a passing outcome.
+func TestRecordLensesRejectsMockRuns(t *testing.T) {
+	root := gitRepo(t)
+	base, head := diffEndpoints(t, root)
+	passing, _ := json.Marshal(fsmrun.TransitionData{Outcome: fsmrun.OutcomeReviewed})
+
+	mockInit, _ := json.Marshal(fsmrun.InitData{BaseSHA: base, Head: head, Mock: "mock/scenario.yaml"})
+	writeRawFSMRun(t, root, "run-scripted", fsmrun.Event{Type: fsmrun.TypeInit, Data: mockInit}, fsmrun.Event{Type: fsmrun.TypeTransition, Data: passing})
+
+	realInit, _ := json.Marshal(fsmrun.InitData{BaseSHA: base, Head: head})
+	writeRawFSMRun(t, root, "run-tainted", fsmrun.Event{Type: fsmrun.TypeInit, Data: realInit}, fsmrun.Event{Type: fsmrun.TypeTransition, Data: passing, Mock: true})
+
+	// The ids avoid the word "mock" so the message match proves which branch rejected the run.
+	for id, want := range map[string]string{"run-scripted": "init names a mock scenario", "run-tainted": "mock-stamped event"} {
+		code, _, errOut := runCLI(t, root, nil, "review", "record-lenses", "--scope", "pr-ready", "--base", "main", "--mode", "subagent-adjudicated", "--from-run", id, "--lenses", "security")
+		if code != 2 || !strings.Contains(errOut, want) {
+			t.Errorf("%s: code=%d err=%q, want exit 2 with %q", id, code, errOut, want)
+		}
+	}
+	// A real run over the same diff is still accepted.
+	writeFSMRun(t, root, "realrun", base, head, "")
+	if code, out, errOut := runCLI(t, root, nil, "review", "record-lenses", "--scope", "pr-ready", "--base", "main", "--mode", "subagent-adjudicated", "--from-run", "realrun", "--lenses", "security"); code != 0 || !strings.Contains(out, "Recorded") {
+		t.Fatalf("real run: code=%d out=%q err=%q", code, out, errOut)
+	}
+}
+
+// TestReviewTaskDoneRejectsFlagShapedTargets (#187): a task-done or epic-ready target that starts with '-' (after
+// trimming whitespace) is a flag typed where
+// the target belongs (e.g. the target was omitted), not a task. Recording a review under it would create a log
+// nobody can re-run, so the CLI refuses it before running anything.
+func TestReviewTaskDoneRejectsFlagShapedTargets(t *testing.T) {
+	root := gitRepo(t)
+	for _, args := range [][]string{
+		{"review", "task-done", "--verbose", "--base", "main"},
+		{"review", "task-done", "--base", "main"},
+		{"review", "task-done", " --help", "--base", "main"},
+		{"review", "task-done", "\t-h", "--base", "main"},
+		{"review", "epic-ready", "--verbose", "--base", "main"},
+		{"review", "epic-ready", " --x", "--base", "main"},
+	} {
+		code, _, errOut := runCLI(t, root, nil, args...)
+		if code != 2 || !strings.Contains(errOut, "must not start with '-'") {
+			t.Errorf("%v: code=%d err=%q, want exit 2 refusing the flag-shaped target", args, code, errOut)
+		}
+	}
+	if entries, _ := os.ReadDir(filepath.Join(root, "docs", "metareview", "reviews")); len(entries) != 0 {
+		t.Fatalf("a refused task-done must not write a review log, found %d", len(entries))
+	}
+}
+
+// review prompt classifies against the same base the scope uses (#175): once main advances, `--base main` is the
+// fork point, so a file the branch added reads as added even though main has since added its own copy.
+func TestReviewPromptClassifiesAgainstTheResolvedBase(t *testing.T) {
+	root := gitRepo(t)
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("checkout", "-q", "main")
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "a.go"), []byte("package src\n\nvar A = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-q", "-m", "main adds its own a.go")
+	git("checkout", "-q", "feature")
+	code, out, _ := runCLI(t, root, nil, "review", "prompt", "--base", "main")
+	if code != 0 || !strings.Contains(out, "added] src/a.go") {
+		t.Fatalf("code=%d; src/a.go must be classified against the fork point (added):\n%s", code, out)
+	}
+	// The range a reviewer is told to read is the resolved fork point, not `main..HEAD` (main's tip).
+	if strings.Contains(out, "main..HEAD") {
+		t.Fatalf("the prompt must name the resolved base, not main's tip:\n%s", out)
+	}
+}
+
+// writeAbandonedRun leaves a run at its fix node in the repository's shared store, recorded for branch at head.
+func writeAbandonedRun(t *testing.T, root, id, branch, head string) {
+	t.Helper()
+	dir := filepath.Join(root, ".git", "metareview", "runs", id)
+	must(t, os.MkdirAll(dir, 0o700))
+	must(t, os.WriteFile(filepath.Join(dir, "workflow.yaml"), []byte(`workflow: t
+version: 1
+vars: {}
+states: [discover, fix, done, failed]
+transitions:
+  - {from: discover, to: fix,  gate: findings_nonempty}
+  - {from: fix,      to: done, gate: commit_exists, outcome: fixed}
+nodes:
+  discover: {kind: review-lenses, exec: subagent, lenses: 2}
+  fix:      {kind: agent-edit}
+convergence:
+  any: [{max_iterations: 2}]
+`), 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "audit.jsonl"), []byte(
+		`{"type":"init","at":"2026-09-28T00:00:00Z","state":"discover","data":{"workflow":"t","branch":"`+branch+`","head":"`+head+`"}}`+"\n"+
+			`{"type":"transition","at":"2026-09-28T00:00:01Z","state":"discover","data":{"to":"fix","to_kind":"agent-edit"}}`+"\n"), 0o600))
+}
+
+// #177 AC-4.8: --all widens what status lists and never its verdict — every form exits the same with and without it —
+// and plain status lists this branch's runs, then the rest by count or, with --all, by branch.
+func TestStatusAllNeverChangesTheExit(t *testing.T) {
+	root := gitRepo(t)
+	const gone = "0000000000000000000000000000000000000001"
+	writeAbandonedRun(t, root, "mrv-t-feature-001", "feature", "")
+	writeAbandonedRun(t, root, "mrv-t-main-00001", "main", gone)
+	writeAbandonedRun(t, root, "mrv-t-gone-00001", "gone", gone)
+	// A legacy run is cleared only when git itself says its head is unreachable: a real commit reachable from nothing.
+	c := exec.Command("git", "commit-tree", "HEAD^{tree}", "-m", "unreachable")
+	c.Dir = root
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_") { // a hook's GIT_DIR must not aim this at another repository
+			c.Env = append(c.Env, kv)
+		}
+	}
+	c.Env = append(c.Env, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+	unreachable, err := c.Output()
+	must(t, err)
+	writeAbandonedRun(t, root, "mrv-t-legacy-001", "", strings.TrimSpace(string(unreachable)))
+	for _, args := range [][]string{
+		{"status", "--json"},
+		{"status", "--json", "--target", "docs/tasks/t.md"},
+		{"status", "--json", "--scope", "branch"},
+		{"status", "--json", "--scope", "branch", "--base", "main"},
+	} {
+		code, out, _ := runCLI(t, root, nil, args...)
+		codeAll, outAll, _ := runCLI(t, root, nil, append(args, "--all")...)
+		if code != codeAll || code != 1 {
+			t.Errorf("%v: exit %d without --all, %d with (want both 1: feature's run blocks)", args, code, codeAll)
+		}
+		if strings.Contains(out, `"elsewhere"`) || !strings.Contains(outAll, "mrv-t-main-00001") {
+			t.Errorf("%v: only --all lists the runs elsewhere:\n%s\n---\n%s", args, out, outAll)
+		}
+		// The fixture also has unreviewed files, so the exit alone cannot show the run blocks: must_clear must name it
+		// in both forms, and never a run that belongs elsewhere.
+		for _, body := range []string{out, outAll} {
+			var r struct {
+				MustClear []struct {
+					RunID string `json:"run_id"`
+				} `json:"must_clear"`
+			}
+			must(t, json.Unmarshal([]byte(body), &r))
+			var runs []string
+			for _, b := range r.MustClear {
+				if b.RunID != "" {
+					runs = append(runs, b.RunID)
+				}
+			}
+			if strings.Join(runs, ",") != "mrv-t-feature-001" {
+				t.Errorf("%v: must_clear must hold exactly feature's run, got %v", args, runs)
+			}
+		}
+	}
+	// An --all that is the operand of --target or --base is the value, not the flag.
+	if code, _, errOut := runCLI(t, root, nil, "status", "--json", "--target", "--all"); code == 2 {
+		t.Errorf("--target --all must target a path named --all, got a usage error: %s", errOut)
+	}
+	if _, _, errOut := runCLI(t, root, nil, "status", "--json", "--scope", "branch", "--base", "--all"); strings.Contains(errOut, "Usage:") {
+		t.Errorf("--base --all must pass --all as the base, got a usage error: %s", errOut)
+	}
+	_, plain, _ := runCLI(t, root, nil, "status")
+	for _, want := range []string{"abandoned runs on this branch: 1", "mrv-t-feature-001  t @ fix  (branch feature)", "abandoned runs elsewhere: 3 (metareview status --all lists them)"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("plain status missing %q:\n%s", want, plain)
+		}
+	}
+	code, all, _ := runCLI(t, root, nil, "status", "--all")
+	// Each line ends in the run's directory, the one to delete (matched by its tail: the root may be a symlink).
+	for _, want := range []string{
+		`branch \(no branch recorded\):\n  mrv-t-legacy-001  t @ fix  \[orphaned\]  \S+/\.git/metareview/runs/mrv-t-legacy-001\n`,
+		`branch gone:\n  mrv-t-gone-00001  t @ fix  \[orphaned\]  \S+/\.git/metareview/runs/mrv-t-gone-00001\n`,
+		`branch main:\n  mrv-t-main-00001  t @ fix  \[other-branch\]  \S+/\.git/metareview/runs/mrv-t-main-00001\n`} {
+		if !regexp.MustCompile(want).MatchString(all) {
+			t.Errorf("status --all missing %s:\n%s", want, all)
+		}
+	}
+	if code != 0 {
+		t.Errorf("plain status is informational: exit %d", code)
+	}
+	if lines := abandonedLines(t.TempDir(), true); lines != nil {
+		t.Errorf("no runs, no lines: %q", lines)
 	}
 }

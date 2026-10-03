@@ -8,10 +8,12 @@ import (
 	"fmt"
 	fsmcli "github.com/dsifry/metareview/internal/fsm/cli"
 	fsmrun "github.com/dsifry/metareview/internal/fsm/run"
+	"gopkg.in/yaml.v3"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,9 +25,11 @@ import (
 	"github.com/dsifry/metareview/internal/epicready"
 	"github.com/dsifry/metareview/internal/evidence"
 	"github.com/dsifry/metareview/internal/findings"
+	"github.com/dsifry/metareview/internal/fsm/machine"
 	"github.com/dsifry/metareview/internal/gitcontext"
 	"github.com/dsifry/metareview/internal/learning"
 	"github.com/dsifry/metareview/internal/mutation"
+	"github.com/dsifry/metareview/internal/mutationfresh"
 	"github.com/dsifry/metareview/internal/prready"
 	"github.com/dsifry/metareview/internal/repo"
 	"github.com/dsifry/metareview/internal/reviewmanifest"
@@ -104,6 +108,7 @@ func printHelp() {
 
 Usage:
   metareview setup --check
+  metareview setup --install-hooks | --uninstall-hooks | --enable-stop-gate | --disable-stop-gate
   metareview setup --bootstrap-prereqs --dry-run
   metareview status [--json]
   metareview fsm <subcommand> [flags]        (metareview fsm --agent-prompt for the driver contract)
@@ -111,22 +116,30 @@ Usage:
   metareview override request <finding-id> --reason "<text>" [--by <who>] [--escalation "<text>"]
   metareview override grant <finding-id> --reason "<text>" [--by <who>]
   metareview override list [--pending]
+  metareview session bind <session-id> <worktree-path> | resolve [<session-id>] | unbind <session-id>
   metareview context build <path>
   metareview context diff [--base <ref>]
   metareview evidence run -- <command> [args...]
   metareview evidence import --github-checks <pr-number> [--repo <owner/repo>]
   metareview review artifact <path> [--previous-run <run-id>] [--scaffold-only]
-  metareview review task-done <task-id-or-path> [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--shard-result <path>]... [--cross-shard-result <path>]
-  metareview review epic-ready <epic-id-or-path> [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]...
-  metareview review pr-ready [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--github-pr <number>] [--include-working-tree] [--shard-result <path>]... [--cross-shard-result <path>]
+  metareview review task-done <task-id-or-path> [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--mutation-view <name>]... [--shard-result <path>]... [--cross-shard-result <path>]
+  metareview review epic-ready <epic-id-or-path> [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--mutation-view <name>]...
+  metareview review pr-ready [--base <ref>] [--previous-run <run-id>] [--max-attempts <n>] [--evidence <path>] [--mutation-report <path>]... [--mutation-view <name>]... [--github-pr <number>] [--include-working-tree] [--shard-result <path>]... [--cross-shard-result <path>]
+  METAREVIEW_MUTATION_FRESHNESS=advisory|enforce  freshness of --mutation-report evidence (docs/mutation-harness.md)
   metareview review record-lenses [--scope pr-ready|task-done|epic-ready] [--base <ref>] [--verdict <v>] [--mode subagent-adjudicated|in-session-emulated] [--lenses a,b,c] [--from-run <fsm-run-id>]
+  metareview review checkpoint --scope pr-ready|task-done|epic-ready
   metareview learn --post-merge <pr-number> [--base <ref>] [--github-pr <number>] [--session-root <path>]
   metareview source-review --model astra|opus|grok --output <dir> [--jobs <n>] [--call-timeout <duration>] [--path <path>]... [<repo>]
 
+  --base last-reviewed (task-done, epic-ready, pr-ready, record-lenses) reviews only what is new since the
+  last passing review of that scope: the head printed by 'review checkpoint'.
+
 Commands:
   setup --check              Detect repository mode and prerequisites without writing files
+  setup --install-hooks      Install the git-native push gate and opt this repository into the Stop gate
+  setup --enable-stop-gate   Opt this repository into the Stop gate only (when another tool owns core.hooksPath)
   setup --bootstrap-prereqs  Print or execute prerequisite bootstrap actions
-  status [--json [--target <path> | --scope branch [--base <ref>]]]
+  status [--all] [--json [--target <path> | --scope branch [--base <ref>]]]
                              Print repository review capability status; --json emits the
                              machine-readable contract a host hook branches on (exit 1 when
                              something must be cleared). --target narrows it to one path, so a
@@ -134,6 +147,8 @@ Commands:
   override request           Record an out-of-workflow escalation against a finding (still blocks)
   override grant             Acknowledge a process exception from outside the workflow (stops blocking)
   override list              List process exceptions; --pending exits 1 while any are unacknowledged
+  session bind|resolve|unbind
+                             Point a host session's Stop hook at the worktree its work is in
   context build <path>       Build a Markdown context pack for an artifact
   context diff               Print git diff context as JSON
   evidence run               Run a command and print a structured JSON receipt
@@ -143,6 +158,7 @@ Commands:
   review epic-ready <target> Run epic-ready integration review
   review pr-ready            Run PR-ready branch review
   review record-lenses       Record an adjudicated lens review over HEAD (satisfies the require-lenses gate)
+  review checkpoint          Print the head of the last passing review of a scope on an ancestor of HEAD
   learn --post-merge         Curate post-merge repository learning
   source-review              Review first-party source with Astra, Opus, or Grok
 `, version.Version)
@@ -172,6 +188,14 @@ func dispatch(args []string) {
 
 	if args[0] == "source-review" {
 		exit(sourcereview.CLI(args[1:], workdir, stdout, stderr))
+		return
+	}
+
+	// `review <subcommand> --help` prints usage and runs nothing: without this, the review
+	// subcommands took "--help" as the target and ran (and logged) a full review of it.
+	if args[0] == "review" && slices.ContainsFunc(args[1:], func(a string) bool { return a == "--help" || a == "-h" }) {
+		printHelp()
+		return
 	}
 
 	if len(args) >= 1 && args[0] == "setup" {
@@ -186,6 +210,21 @@ func dispatch(args []string) {
 	// status --json is the contract a host hook branches on: one machine-readable answer to
 	// "may work proceed, and if not, what must be cleared". Exits 1 when something must be
 	// cleared, so a hook needs no parsing to make the common decision.
+	// --all (#177) widens what status shows — every abandoned run, grouped by branch — and never its verdict: it is
+	// taken out of the arguments here, so each form below parses exactly as without it.
+	statusAll := false
+	if len(args) >= 1 && args[0] == "status" {
+		kept := []string{"status"}
+		for _, a := range args[1:] {
+			// An --all that is the operand of --target or --base is a value, not the flag.
+			if prev := kept[len(kept)-1]; a == "--all" && prev != "--target" && prev != "--base" {
+				statusAll = true
+				continue
+			}
+			kept = append(kept, a)
+		}
+		args = kept
+	}
 	if len(args) >= 2 && args[0] == "status" && args[1] == "--json" {
 		// --target narrows the answer to the work in hand. Unscoped, `blocked` spans the whole
 		// review history, so a hook wired to it refuses an agent because of work it never
@@ -205,12 +244,16 @@ func dispatch(args []string) {
 		} else if len(args) == 6 && args[2] == "--scope" && args[3] == "branch" && args[4] == "--base" {
 			scopeBranch, base = true, args[5]
 		} else {
-			_, _ = fmt.Fprintln(stderr, "Usage: metareview status --json [--target <path> | --scope branch [--base <ref>]]")
+			_, _ = fmt.Fprintln(stderr, "Usage: metareview status --json [--all] [--target <path> | --scope branch [--base <ref>]]")
 			exit(2)
 		}
 		if scopeBranch {
 			// The scope a Stop hook wants: this branch's own commits and the files it changed.
-			code, err := status.EmitForBranch(repo.RootOr(workdir), base, nil, stdout)
+			emitBranch := status.EmitForBranch
+			if statusAll {
+				emitBranch = status.EmitForBranchAll
+			}
+			code, err := emitBranch(repo.RootOr(workdir), base, nil, stdout)
 			exitGateBroken(err)
 			if code != 0 {
 				exit(code)
@@ -220,7 +263,11 @@ func dispatch(args []string) {
 		// Resolved from the repository root, not the process cwd. A Stop hook inherits whatever
 		// directory the session is standing in, and resolving there found no review logs and
 		// reported nothing to clear — the gate was bypassed by working in a subdirectory.
-		code, err := status.EmitFor(repo.RootOr(workdir), target, stdout)
+		emitFor := status.EmitFor
+		if statusAll {
+			emitFor = status.EmitForAll
+		}
+		code, err := emitFor(repo.RootOr(workdir), target, stdout)
 		exitGateBroken(err)
 		if code != 0 {
 			exit(code)
@@ -238,11 +285,19 @@ func dispatch(args []string) {
 		for _, line := range fsmcli.StatusLines(context.Background(), fsmcli.RealDeps(), workdir) {
 			_, _ = fmt.Fprintln(stdout, line)
 		}
+		for _, line := range abandonedLines(repo.RootOr(workdir), statusAll) {
+			_, _ = fmt.Fprintln(stdout, line)
+		}
 		return
 	}
 
 	if args[0] == "override" {
 		handleOverride(args[1:])
+		return
+	}
+
+	if args[0] == "session" {
+		handleSession(args[1:])
 		return
 	}
 
@@ -305,6 +360,8 @@ func dispatch(args []string) {
 	}
 
 	if len(args) >= 3 && args[0] == "review" && args[1] == "task-done" {
+		refuseFlagShapedTarget("task-done", args[2])
+		mustFreshnessMode()
 		options := taskdone.Options{}
 		for i := 3; i < len(args); i++ {
 			switch args[i] {
@@ -323,6 +380,9 @@ func dispatch(args []string) {
 			case "--mutation-report":
 				options.MutationReportPaths = append(options.MutationReportPaths, mustMutationReport(flagValue(args, i, "--mutation-report")))
 				i++
+			case "--mutation-view":
+				options.MutationViews = appendUnique(options.MutationViews, flagValue(args, i, "--mutation-view"))
+				i++
 			case "--shard-result":
 				options.ShardResultPaths = append(options.ShardResultPaths, mustResultFile(flagValue(args, i, "--shard-result")))
 				i++
@@ -334,6 +394,9 @@ func dispatch(args []string) {
 				exit(2)
 			}
 		}
+		mustMutationViews(options.MutationReportPaths, options.MutationViews)
+		options.Incremental = options.Base == reviewstate.LastReviewedBase
+		options.Base = resolveBaseToken("task-done", options.Base)
 		result, err := taskdone.Create(workdir, args[2], options)
 		exitOnErr(err)
 		_, _ = fmt.Fprintln(stdout, result.ReviewRel)
@@ -344,6 +407,8 @@ func dispatch(args []string) {
 	}
 
 	if len(args) >= 3 && args[0] == "review" && args[1] == "epic-ready" {
+		refuseFlagShapedTarget("epic-ready", args[2])
+		mustFreshnessMode()
 		options := epicready.Options{}
 		for i := 3; i < len(args); i++ {
 			switch args[i] {
@@ -362,11 +427,17 @@ func dispatch(args []string) {
 			case "--mutation-report":
 				options.MutationReportPaths = append(options.MutationReportPaths, mustMutationReport(flagValue(args, i, "--mutation-report")))
 				i++
+			case "--mutation-view":
+				options.MutationViews = appendUnique(options.MutationViews, flagValue(args, i, "--mutation-view"))
+				i++
 			default:
 				_, _ = fmt.Fprintf(stderr, "Unknown option: %s\n", args[i])
 				exit(2)
 			}
 		}
+		mustMutationViews(options.MutationReportPaths, options.MutationViews)
+		options.Incremental = options.Base == reviewstate.LastReviewedBase
+		options.Base = resolveBaseToken("epic-ready", options.Base)
 		result, err := epicready.Create(workdir, args[2], options)
 		exitOnErr(err)
 		_, _ = fmt.Fprintln(stdout, result.ReviewRel)
@@ -394,14 +465,32 @@ func dispatch(args []string) {
 		root := repo.RootOr(workdir)
 		scope, err := status.ResolveBranchScope(root, base, nil)
 		exitOnErr(err)
-		label := base
-		if label == "" {
-			label = scope.Base
-			if len(label) > 12 {
-				label = label[:12]
+		// Label and classify with the RESOLVED base (#175): `--base main` means the fork point, and a reviewer
+		// told to read `main..HEAD` would diff main's tip instead.
+		label := scope.Base
+		if len(label) > 12 {
+			label = label[:12]
+		}
+		_, _ = fmt.Fprint(stdout, reviewprompt.Build(label, scope.Files, status.ChangeKinds(root, scope.Base, nil)))
+		exit(0)
+	}
+	if len(args) >= 2 && args[0] == "review" && args[1] == "checkpoint" {
+		scope := ""
+		for i := 2; i < len(args); i++ {
+			switch args[i] {
+			case "--scope":
+				scope = flagValue(args, i, "--scope")
+				i++
+			default:
+				_, _ = fmt.Fprintf(stderr, "Unknown option: %s\n", args[i])
+				exit(2)
 			}
 		}
-		_, _ = fmt.Fprint(stdout, reviewprompt.Build(label, scope.Files, status.ChangeKinds(root, base, nil)))
+		if scope != "pr-ready" && scope != "task-done" && scope != "epic-ready" {
+			_, _ = fmt.Fprintln(stderr, "review checkpoint: --scope must be pr-ready, task-done, or epic-ready")
+			exit(2)
+		}
+		_, _ = fmt.Fprintln(stdout, resolveBaseToken(scope, reviewstate.LastReviewedBase))
 		exit(0)
 	}
 	if len(args) >= 2 && args[0] == "review" && args[1] == "record-lenses" {
@@ -445,13 +534,17 @@ func dispatch(args []string) {
 			exit(2)
 		}
 		root := repo.RootOr(workdir)
-		gc, err := gitcontext.Collect(root, base)
+		gc, err := gitcontext.Collect(root, resolveBaseToken(scope, base))
 		exitOnErr(err) // a repo with no HEAD/base fails here ("invalid git base"), so gc.HeadSHA is non-empty below
+		if base == reviewstate.LastReviewedBase {
+			gc.RequestedBase = base // the marker records the token it was asked for, beside the checkpoint SHA
+		}
 		// A CLI seam cannot witness that independent subagents actually ran, so it must not let a hand-typed
 		// `--mode subagent-adjudicated` launder a self-attested review as independent, full-strength evidence
 		// (the gate would then trust it with no advisory trace). subagent-adjudicated is therefore admitted
-		// only when it mirrors a real FSM review run: --from-run must name a run whose init records the SAME
-		// base..head this marker claims. A self-attested review has no such run and must record the labeled,
+		// only when it mirrors a real FSM review run: --from-run must name a run that reviewed the SAME base..head
+		// this marker claims (its init, or the head its lenses last reviewed before a clean/reviewed ending —
+		// validateFromRunDiff). A self-attested review has no such run and must record the labeled,
 		// advisory in-session-emulated mode.
 		if mode == reviewstate.ReviewModeSubagentAdjudicated {
 			if fromRun == "" {
@@ -470,7 +563,13 @@ func dispatch(args []string) {
 			if scope == "epic-ready" {
 				wantWorkflow = "epic-review-loop"
 			}
-			if err := validateFromRunDiff(root, fromRun, gc.BaseSHA, gc.HeadSHA, wantWorkflow); err != nil {
+			// The run is read from the store the FSM wrote it to — git's common directory, shared by every
+			// worktree (#169, #173) — while base..head above stays this worktree's diff.
+			runsDir, warn := fromRunRunsDir(workdir, fromRun)
+			if warn != "" {
+				_, _ = fmt.Fprintln(stderr, "record-lenses: "+warn)
+			}
+			if err := validateFromRunDiff(runsDir, fromRun, gc.BaseSHA, gc.HeadSHA, wantWorkflow); err != nil {
 				_, _ = fmt.Fprintf(stderr, "record-lenses: --from-run %q: %v\n", fromRun, err)
 				exit(2)
 			}
@@ -488,7 +587,7 @@ func dispatch(args []string) {
 			exit(2)
 		}
 		exitOnErr(reviewstate.RecordReviewEvidence(root, reviewstate.ReviewEvidence{
-			ReviewedScope: scope, HeadSHA: gc.HeadSHA, BaseSHA: gc.BaseSHA,
+			ReviewedScope: scope, HeadSHA: gc.HeadSHA, BaseSHA: gc.BaseSHA, RequestedBase: gc.RequestedBase,
 			LensSet: lenses, AdjudicatedVerdict: verdict, ExecutionMode: mode, FromFSMRunID: fromRun,
 		}))
 		_, _ = fmt.Fprintf(stdout, "Recorded %s review-evidence at head %s (mode=%s, verdict=%s).\n", scope, gc.HeadSHA, mode, verdict)
@@ -548,6 +647,7 @@ func dispatch(args []string) {
 		exit(0)
 	}
 	if len(args) >= 2 && args[0] == "review" && args[1] == "pr-ready" {
+		mustFreshnessMode()
 		options := prready.Options{}
 		for i := 2; i < len(args); i++ {
 			switch args[i] {
@@ -566,6 +666,9 @@ func dispatch(args []string) {
 			case "--mutation-report":
 				options.MutationReportPaths = append(options.MutationReportPaths, mustMutationReport(flagValue(args, i, "--mutation-report")))
 				i++
+			case "--mutation-view":
+				options.MutationViews = appendUnique(options.MutationViews, flagValue(args, i, "--mutation-view"))
+				i++
 			case "--github-pr":
 				options.GitHubPR = flagValue(args, i, "--github-pr")
 				i++
@@ -582,6 +685,9 @@ func dispatch(args []string) {
 				exit(2)
 			}
 		}
+		mustMutationViews(options.MutationReportPaths, options.MutationViews)
+		options.Incremental = options.Base == reviewstate.LastReviewedBase
+		options.Base = resolveBaseToken("pr-ready", options.Base)
 		result, err := prready.Create(workdir, options)
 		exitOnErr(err)
 		_, _ = fmt.Fprintln(stdout, result.ReviewRel)
@@ -717,16 +823,38 @@ func bundleExitCode(bundle evidence.Bundle) int {
 // told the operator they had review findings, while emitting no JSON and so no blockers to act
 // on — an unreadable review log became "you have work to do, and I cannot say what". A check that
 // did not run must never be reported as a check that found something.
-// validateFromRunDiff confirms that the FSM run named by --from-run is a real review run that (a) reviewed
-// the SAME base..head the marker claims (its init event) and (b) reached a PASSING terminal transition
+// validateFromRunDiff confirms that the FSM run named by --from-run is a real, non-mock review run that (a) reviewed
+// the SAME base..head the marker claims — its init event's, or (mr-1ad) the head at which its final clean/reviewed
+// transition passed when its last review-lenses node reviewed that very head — and (b) reached a PASSING terminal transition
 // (outcome clean|reviewed|fixed). This keeps a subagent-adjudicated marker from being pointed at an empty
 // audit, a run over a different diff, or a run that reviewed the diff and did NOT come out clean. It scans
 // events leniently (in the spirit of the FSM's own peek) rather than folding the full chain.
-func validateFromRunDiff(root, runID, wantBase, wantHead, wantWorkflow string) error {
-	path := filepath.Join(root, ".metareview", "runs", runID, "audit.jsonl")
+// fromRunRunsDir names the runs directory to read an FSM run from (#173): the shared store in git's common directory
+// (repo.StoreDir), where the FSM writes every run. For one release a run still in the 0.13.x location — the main
+// checkout's .metareview/runs/, not yet migrated because no fsm command has run since the upgrade — is read there,
+// with a warning naming how to migrate it. Nothing else is searched: no other worktree, no other checkout.
+func fromRunRunsDir(start, runID string) (dir, warn string) {
+	store, err := repo.StoreDir(start)
+	if err != nil {
+		store = filepath.Join(repo.RootOr(start), ".git", "metareview") // no repository: a path that holds nothing
+	}
+	dir = filepath.Join(store, "runs") // run-store: shared — git's common directory (repo.StoreDir)
+	if _, err := os.Stat(filepath.Join(dir, runID)); err == nil {
+		return dir, ""
+	}
+	// run-store: shared — the 0.13.x store lived in the main worktree (repo.RunStoreRoot).
+	legacy := filepath.Join(repo.RunStoreRoot(start), ".metareview", "runs")
+	if _, err := os.Stat(filepath.Join(legacy, runID)); err == nil {
+		return legacy, "run " + runID + " is still in the 0.13.x store (" + legacy + "); any `metareview fsm` command migrates it into " + dir
+	}
+	return dir, ""
+}
+
+func validateFromRunDiff(runsDir, runID, wantBase, wantHead, wantWorkflow string) error {
+	path := filepath.Join(runsDir, runID, "audit.jsonl")
 	raw, err := os.ReadFile(path) // #nosec G304 -- runID is validated to a single path segment by the caller
 	if err != nil {
-		return errors.New("no such FSM run under .metareview/runs/")
+		return errors.New("no such FSM run in the store")
 	}
 	var events []fsmrun.Event
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -746,20 +874,22 @@ func validateFromRunDiff(root, runID, wantBase, wantHead, wantWorkflow string) e
 	if json.Unmarshal(events[0].Data, &d) != nil {
 		return errors.New("its init event is unreadable")
 	}
-	if d.Head != wantHead || d.BaseSHA != wantBase {
-		return fmt.Errorf("it reviewed a different diff (run base..head %s..%s, marker %s..%s)", short(d.BaseSHA), short(d.Head), short(wantBase), short(wantHead))
+	// A mock run is test infrastructure: its judge verdicts come from a scripted scenario, so it is never evidence
+	// that an independent review happened (#185). That covers a run initialised with a mock scenario and a real run
+	// that took a mock-stamped event (the FSM's own mock taint).
+	if d.Mock != "" {
+		return errors.New("it is a mock run (init names a mock scenario); a mock run never satisfies a gate")
 	}
-	// For a scope whose lenses must apply a scope-specific rubric (epic-ready), the run must have been produced
-	// by that scope's review workflow — otherwise a generic review-loop run (task-done rubric) over the same
-	// diff could be recorded as subagent-adjudicated evidence for the epic gate, silently crediting a review
-	// that never applied the epic lenses. wantWorkflow is empty for pr-ready/task-done (no constraint).
-	if wantWorkflow != "" && d.Workflow != wantWorkflow {
-		return fmt.Errorf("it was produced by workflow %q, but this scope requires %q (whose lenses apply the scope's rubric)", d.Workflow, wantWorkflow)
+	for _, ev := range events {
+		if ev.Mock {
+			return errors.New("it is mock-tainted (it carries a mock-stamped event); a mock run never satisfies a gate")
+		}
 	}
 	// The LAST outcome-bearing transition is the run's verdict: a run that was `reviewed` and then looped and
 	// came out `failed` must be rejected, so we cannot accept the first passing outcome we see. Unreadable
 	// transition payloads are rejected rather than skipped (a run we cannot parse is not a run we can trust).
 	var lastOutcome fsmrun.Outcome
+	var lastOutcomeHead string
 	sawOutcome := false
 	for _, ev := range events {
 		if ev.Type != fsmrun.TypeTransition {
@@ -770,13 +900,80 @@ func validateFromRunDiff(root, runID, wantBase, wantHead, wantWorkflow string) e
 			return errors.New("its audit.jsonl has an unreadable transition event")
 		}
 		if td.Outcome != "" {
-			lastOutcome, sawOutcome = td.Outcome, true
+			lastOutcome, lastOutcomeHead, sawOutcome = td.Outcome, td.Head, true
 		}
+	}
+	// The run reviewed its init head; a fix loop that ended with a fresh review passing (clean, or adjudicated) at a
+	// head it committed reviewed that head too (mr-1ad). A `fixed` ending verified its fix without re-reviewing it, so
+	// only its init head counts. The base is the run's either way.
+	reviewedHead := d.Head == wantHead ||
+		lastOutcomeHead == wantHead && (lastOutcome == fsmrun.OutcomeClean || lastOutcome == fsmrun.OutcomeReviewed) &&
+			lensesReviewedFinalHead(filepath.Join(runsDir, runID), events, wantHead)
+	if !reviewedHead || d.BaseSHA != wantBase {
+		return fmt.Errorf("it reviewed a different diff (run base..head %s..%s, marker %s..%s)", short(d.BaseSHA), short(d.Head), short(wantBase), short(wantHead))
+	}
+	// For a scope whose lenses must apply a scope-specific rubric (epic-ready), the run must have been produced
+	// by that scope's review workflow — otherwise a generic review-loop run (task-done rubric) over the same
+	// diff could be recorded as subagent-adjudicated evidence for the epic gate, silently crediting a review
+	// that never applied the epic lenses. wantWorkflow is empty for pr-ready/task-done (no constraint).
+	if wantWorkflow != "" && d.Workflow != wantWorkflow {
+		return fmt.Errorf("it was produced by workflow %q, but this scope requires %q (whose lenses apply the scope's rubric)", d.Workflow, wantWorkflow)
 	}
 	if sawOutcome && isPassingReviewOutcome(lastOutcome) {
 		return nil // the run's final verdict was a passing review over the right diff
 	}
 	return errors.New("its final outcome is not a passing review (clean|reviewed|fixed)")
+}
+
+// lensesReviewedFinalHead reports whether the run's lenses reviewed head itself: the last review-lenses node event — its
+// needs_input, or a node_output a driver recorded without asking (which carries no head, so it is taken at the head the
+// run last recorded) — was at head, and no transition since moved away from it. The head a transition
+// stamps is only git's HEAD when it fired — a commit made after the last review (discover at H1, commit H2, adjudicate
+// to done) would otherwise launder unreviewed code into a marker for H2. The node kinds come from the workflow the run
+// stored at init; without it nothing shows which node reviewed what, so the final head is not accepted (fail closed).
+func lensesReviewedFinalHead(runDir string, events []fsmrun.Event, head string) bool {
+	raw, err := os.ReadFile(filepath.Join(runDir, machine.SidecarWorkflow)) // #nosec G304 -- runDir is the validated run's own directory
+	if err != nil {
+		return false
+	}
+	var wf struct {
+		Nodes map[string]struct {
+			Kind string `yaml:"kind"`
+		} `yaml:"nodes"`
+	}
+	if yaml.Unmarshal(raw, &wf) != nil {
+		return false
+	}
+	// The run's head as its events recorded it (needs_input, transition and tree events carry one); an unreadable
+	// payload leaves it empty, which matches nothing: fail closed.
+	last, current, reviewed := -1, "", ""
+	for i, ev := range events {
+		var h struct {
+			Head string `json:"head"`
+		}
+		switch ev.Type {
+		case fsmrun.TypeNeedsInput, fsmrun.TypeTransition, fsmrun.TypeTree:
+			_ = json.Unmarshal(ev.Data, &h)
+			current = h.Head
+		}
+		if (ev.Type == fsmrun.TypeNeedsInput || ev.Type == fsmrun.TypeNodeOutput) && wf.Nodes[ev.Node].Kind == "review-lenses" {
+			last, reviewed = i, current
+		}
+	}
+	if last < 0 || reviewed != head {
+		return false
+	}
+	for _, ev := range events[last+1:] {
+		if ev.Type != fsmrun.TypeTransition {
+			continue
+		}
+		var td fsmrun.TransitionData
+		_ = json.Unmarshal(ev.Data, &td)
+		if td.Head != head {
+			return false
+		}
+	}
+	return true
 }
 
 // isPassingReviewOutcome reports whether an FSM terminal outcome means the review passed — a clean review,
@@ -791,6 +988,50 @@ func short(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// resolveBaseToken turns the reserved `--base last-reviewed` into the scope's checkpoint (#176) — the nearest head
+// on this branch whose latest review passed and whose reviews reach back to the fork point, read from the markers
+// recorded in this checkout (reviewstate.Checkpoint); any other base is returned unchanged.
+// With no such review there is nothing to be incremental from: exit 2 naming the problem, before anything is
+// recorded.
+func resolveBaseToken(scope, base string) string {
+	if base != reviewstate.LastReviewedBase {
+		return base
+	}
+	root := repo.RootOr(workdir)
+	head, err := gitcontext.Head(root)
+	exitOnErr(err)
+	forkPoint, forked, err := gitcontext.ForkPoint(root)
+	exitOnErr(err)
+	if !forked {
+		_, _ = fmt.Fprintf(stderr, "--base %s: HEAD has no fork point — there is no local main or master, or HEAD has no commits of its own past it (a detached main tip, a branch already in main) — so no review can be shown to cover the whole branch; pass an explicit --base\n", reviewstate.LastReviewedBase)
+		exit(2)
+	}
+	sha, ok, err := reviewstate.Checkpoint(root, scope, head, forkPoint, func(ancestor, descendant string) (bool, error) {
+		// A marker's head or base that no longer exists here (a rebased head pruned by gc, runs.jsonl copied from
+		// another clone) is simply not an ancestor, not a fatal error.
+		if exists, err := gitcontext.CommitExists(root, ancestor); err != nil || !exists {
+			return false, err
+		}
+		return gitcontext.IsAncestor(root, ancestor, descendant)
+	})
+	exitOnErr(err)
+	if !ok {
+		_, _ = fmt.Fprintf(stderr, "--base %s: no passing %s review on an ancestor of HEAD covers the branch back to its fork point (a later NEEDS_REVISION, a narrow --base, or a marker with no recorded base does not); review from the fork point first (e.g. --base main)\n", reviewstate.LastReviewedBase, scope)
+		exit(2)
+	}
+	return sha
+}
+
+// refuseFlagShapedTarget exits 2 when a review target starts with '-' once whitespace is trimmed: that is a flag
+// typed where the target belongs (usually an omitted target), not a task or epic. Recording a review under it
+// creates a log nobody can re-run or supersede (#187), so it is refused before anything runs.
+func refuseFlagShapedTarget(scope, target string) {
+	if strings.HasPrefix(strings.TrimSpace(target), "-") {
+		_, _ = fmt.Fprintf(stderr, "review %s: the target must not start with '-' (got %q); pass the target before any options\n", scope, target)
+		exit(2)
+	}
 }
 
 func exitGateBroken(err error) {
@@ -817,6 +1058,24 @@ func handleSetup(args []string) {
 		bytes, err := json.MarshalIndent(report, "", "  ")
 		exitOnErr(err)
 		_, _ = fmt.Fprintln(stdout, string(bytes))
+		return
+	}
+
+	// The Stop-gate opt-in alone (#194): for a repository whose own hook manager owns core.hooksPath, where
+	// --install-hooks refuses rather than override it.
+	if len(args) == 1 && args[0] == "--enable-stop-gate" {
+		exitOnErr(setup.EnableStopGate(repo.RootOr(workdir), nil))
+		_, _ = fmt.Fprintln(stdout, "metareview: this repository has opted into the Stop gate (metareview.stopGate=true); the plugin's Stop hook now gates session completion here.")
+		return
+	}
+	if len(args) == 1 && args[0] == "--disable-stop-gate" {
+		changed, err := setup.DisableStopGate(repo.RootOr(workdir), nil)
+		exitOnErr(err)
+		if changed {
+			_, _ = fmt.Fprintln(stdout, "metareview: this repository no longer opts into the Stop gate.")
+		} else {
+			_, _ = fmt.Fprintln(stdout, "metareview: this repository had not opted into the Stop gate; nothing changed.")
+		}
 		return
 	}
 
@@ -851,7 +1110,7 @@ func handleSetup(args []string) {
 	}
 
 	if !bootstrap {
-		_, _ = fmt.Fprintln(stderr, "Usage: metareview setup --check | --install-hooks [--dry-run|--yes|--force] | --uninstall-hooks [--dry-run|--yes] | --bootstrap-prereqs [--dry-run] [--confirm-bootstrap-prereqs]")
+		_, _ = fmt.Fprintln(stderr, "Usage: metareview setup --check | --install-hooks [--dry-run|--yes|--force] | --uninstall-hooks [--dry-run|--yes] | --enable-stop-gate | --disable-stop-gate | --bootstrap-prereqs [--dry-run] [--confirm-bootstrap-prereqs]")
 		exit(2)
 	}
 	options := setup.BootstrapOptions{DryRun: dryRun, Confirm: yes}
@@ -888,7 +1147,7 @@ func handleHookInstall(uninstall, yes, force, dryRun bool) {
 		_, _ = fmt.Fprintln(stdout, "metareview review gate — uninstall (git-native hooks)")
 		_, _ = fmt.Fprintln(stdout, "  Currently: core.hooksPath = "+current)
 		if !status.WouldChange {
-			_, _ = fmt.Fprintln(stdout, "\nNothing to uninstall — core.hooksPath is not metareview's hooks/git. No changes made.")
+			_, _ = fmt.Fprintln(stdout, "\nNothing to uninstall — core.hooksPath is not metareview's hook location. No changes made.")
 			return
 		}
 		_, _ = fmt.Fprintln(stdout, "  Will UNSET core.hooksPath — the pre-push gate and post-commit nudge stop running on this repo.")
@@ -920,7 +1179,7 @@ func handleHookInstall(uninstall, yes, force, dryRun bool) {
 		if changed {
 			_, _ = fmt.Fprintln(stdout, "metareview: uninstalled — core.hooksPath unset; the git-native review gate no longer runs.")
 		} else {
-			_, _ = fmt.Fprintln(stdout, "metareview: nothing to uninstall — core.hooksPath was not metareview's hooks/git.")
+			_, _ = fmt.Fprintln(stdout, "metareview: nothing to uninstall — core.hooksPath was not metareview's hook location.")
 		}
 		return
 	}
@@ -942,6 +1201,8 @@ func handleHookInstall(uninstall, yes, force, dryRun bool) {
 			_, _ = fmt.Fprintln(stdout, "  - "+c)
 		}
 		_, _ = fmt.Fprintln(stdout, "Resolve it, or re-run with --force to override.")
+		// --force would override the other tool's hooks. The Stop gate does not need core.hooksPath (#194).
+		_, _ = fmt.Fprintln(stdout, "To keep that tool's hooks and still gate session completion here, opt into the Stop gate alone: metareview setup --enable-stop-gate")
 		exit(1)
 	}
 	if dryRun {
@@ -978,9 +1239,10 @@ func printHookPlan(plan setup.HookInstallPlan) {
 	}
 	_, _ = fmt.Fprintln(stdout, "metareview review gate — git-native hooks")
 	_, _ = fmt.Fprintln(stdout, "  Will write: the pre-push + post-commit hook scripts into "+plan.Target)
-	_, _ = fmt.Fprintln(stdout, "  Will set:   core.hooksPath = "+plan.Target+"   (this clone only)")
+	_, _ = fmt.Fprintln(stdout, "  Will set:   core.hooksPath = "+plan.Target+"   (this repository; its id is kept")
+	_, _ = fmt.Fprintln(stdout, "              in metareview.hooksId, and a pre-#173 .metareview/git-hooks is migrated)")
 	_, _ = fmt.Fprintln(stdout, "  Will add:   metareview's ephemeral-state block to .gitignore — ignore .metareview/* (runs,")
-	_, _ = fmt.Fprintln(stdout, "              findings, shards, the hook scripts) while keeping the durable learning files")
+	_, _ = fmt.Fprintln(stdout, "              findings, shards) while keeping the durable learning files")
 	_, _ = fmt.Fprintln(stdout, "              (knowledge/metareview.jsonl, calibration.jsonl, learning-runs.jsonl) committable")
 	_, _ = fmt.Fprintln(stdout, "  Currently:  core.hooksPath = "+current)
 	_, _ = fmt.Fprintln(stdout, "  Effect:     git runs the pre-push gate (BLOCKS an unreviewed push) and the")
@@ -1080,7 +1342,7 @@ func handleOverride(args []string) {
 		}
 	case "request", "grant":
 		if len(args) < 2 {
-			_, _ = fmt.Fprintf(stderr, "Usage: metareview override %s <finding-id> --reason \"<text>\"\n", args[0])
+			_, _ = fmt.Fprintf(stderr, "Usage: metareview override %s <finding-id|run-id> --reason \"<text>\"\n", args[0])
 			exit(2)
 		}
 		id := args[1]
@@ -1111,14 +1373,17 @@ func handleOverride(args []string) {
 			by = defaultActor()
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
+		// An abandoned FSM run is closed through the same flow (#179): its ID takes a closure row when nothing else
+		// knows it.
+		subject, _ := status.RunClosureSubject(root, id, now)
 		if args[0] == "request" {
 			exitOnErr(findings.RequestOverride(root, id, findings.OverrideRequest{
-				By: by, Reason: reason, Escalation: escalation, Now: now,
+				By: by, Reason: reason, Escalation: escalation, Now: now, Subject: subject,
 			}))
 			_, _ = fmt.Fprintf(stdout, "%s: override requested by %s (still blocking until granted)\n", id, by)
 			return
 		}
-		exitOnErr(findings.GrantOverride(root, id, findings.OverrideGrant{By: by, Reason: reason, Now: now}))
+		exitOnErr(findings.GrantOverride(root, id, findings.OverrideGrant{By: by, Reason: reason, Now: now, Subject: subject}))
 		_, _ = fmt.Fprintf(stdout, "%s: override granted by %s\n", id, by)
 	default:
 		_, _ = fmt.Fprintln(stderr, "Usage: metareview override request|grant|list")
@@ -1182,6 +1447,41 @@ func mustResultFile(path string) string {
 	return path
 }
 
+// mustFreshnessMode refuses an invalid METAREVIEW_MUTATION_FRESHNESS before any review runs (spec §6.4).
+func mustFreshnessMode() {
+	if _, err := mutationfresh.ModeFromEnv(os.Getenv); err != nil {
+		_, _ = fmt.Fprintf(stderr, "%v\n", err)
+		exit(2)
+	}
+}
+
+// mustMutationViews rejects --mutation-view names the review could not scope (spec §11.3): a view
+// without a report, an invalid name, or one missing from an attested report's view map.
+func mustMutationViews(reportPaths, views []string) {
+	if len(views) == 0 {
+		return
+	}
+	if len(reportPaths) == 0 {
+		_, _ = fmt.Fprintln(stderr, "--mutation-view needs --mutation-report")
+		exit(2)
+	}
+	reports, err := mutation.LoadAll(reportPaths)
+	if err == nil {
+		err = mutationfresh.CheckViews(reports, views)
+	}
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%v\n", err)
+		exit(2)
+	}
+}
+
+func appendUnique(list []string, value string) []string {
+	if slices.Contains(list, value) {
+		return list
+	}
+	return append(list, value)
+}
+
 // mustMutationReport rejects a --mutation-report file the review could not act on, at the point
 // the operator can still fix it. Parsing here as well as in the review is deliberate: a typo in a
 // path or a truncated report otherwise surfaces as a review that found nothing, which reads
@@ -1201,4 +1501,59 @@ func mustMutationReport(path string) string {
 		reject(err.Error())
 	}
 	return path
+}
+
+// abandonedLines renders abandoned FSM runs for plain `status` (#177): this branch's (the ones that block), then a
+// count of the rest — or, with --all, the rest grouped by the branch they belong to, orphans labelled.
+func abandonedLines(root string, all bool) []string {
+	mine, elsewhere := status.ScanAbandonedRuns(root)
+	if len(mine)+len(elsewhere) == 0 {
+		return nil
+	}
+	lines := []string{fmt.Sprintf("abandoned runs on this branch: %d", len(mine))}
+	for _, a := range mine {
+		line := "  " + a.RunID + "  " + a.Workflow + " @ " + a.State
+		if a.Branch != "" { // a stacked branch inherits its base's runs: say whose each one is
+			line += "  (branch " + a.Branch + ")"
+		}
+		if a.CloseRequestedBy != "" { // #179: a request does not close it; say who is waiting on a grant
+			line += "  (close requested by " + a.CloseRequestedBy + ")"
+		}
+		lines = append(lines, line)
+	}
+	if !all {
+		closed := 0
+		for _, a := range elsewhere {
+			if a.Scope == status.ClosedScope {
+				closed++
+			}
+		}
+		if n := len(elsewhere) - closed; n > 0 {
+			lines = append(lines, fmt.Sprintf("abandoned runs elsewhere: %d (metareview status --all lists them)", n))
+		}
+		if closed > 0 {
+			lines = append(lines, fmt.Sprintf("closed runs: %d (metareview status --all lists them)", closed))
+		}
+		return lines
+	}
+	last := "\x00"
+	for _, a := range elsewhere {
+		if a.Branch != last {
+			name := a.Branch
+			if name == "" {
+				name = "(no branch recorded)"
+			}
+			lines = append(lines, "branch "+name+":")
+			last = a.Branch
+		}
+		line := "  " + a.RunID + "  " + a.Workflow + " @ " + a.State + "  [" + a.Scope + "]  " + a.Dir
+		switch {
+		case a.ClosedBy != "": // #179: who closed it and why
+			line += "  closed by " + a.ClosedBy + " at " + a.ClosedAt + ": " + a.CloseReason
+		case a.CloseRequestedBy != "":
+			line += "  (close requested by " + a.CloseRequestedBy + ")"
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }

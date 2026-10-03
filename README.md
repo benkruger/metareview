@@ -28,7 +28,8 @@ standalone or as a deeper review engine inside metaswarm, Superpowers, and Beads
   (tag/file/lines/issue/consequence/confidence/severity) validated deterministically before they can
   become candidates: malformed entries are rejected and counted (never crash the run), and an
   **anchor-in-diff gate** (±10 context lines) rejects findings that cite files or lines the diff never
-  touched. Benchmarked in the lab (dsifry/metareview#159): the typed schema cut output tokens 27%, and
+  touched. An output with nothing kept and anything rejected fails the node instead of ending the loop clean
+  (mr-0vk); only entries suppressed below the confidence floor read as "nothing to raise". Benchmarked in the lab (dsifry/metareview#159): the typed schema cut output tokens 27%, and
   the anchor gate is a real fabricated-finding catcher at F1-neutral. Judge transports also retry a
   gateway's `400` output-limit answer once at 4× the cap — transport headroom only, calibration frozen.
 - **📚 Learns locally.** Post-merge learning extracts durable, git-native, human-readable lessons — no
@@ -86,6 +87,22 @@ metareview is built around review patterns that work well when humans and coding
 - **Repository-knowledge priming:** load service inventories, Beads knowledge, session history, and GitHub history so reviewers catch duplicated services, stale assumptions, and prior mistakes.
 - **Review artifact accountability:** write durable Markdown context and review logs so future humans and agents can inspect what was reviewed, what blocked, and why it passed.
 - **Post-merge reflection:** after a PR lands, extract accepted learnings, discarded candidates, and reviewer calibration so the next review starts smarter.
+
+## Highlights in 0.13.0
+
+0.13.0 is the mutation-incremental release (guide: [docs/mutation-harness.md](docs/mutation-harness.md)):
+
+- **Change-driven StrykerJS runs.** A zero-dependency harness template (`templates/mutation-incremental/`)
+  plans from content digests, never dates. It re-runs only what a change can affect, defers what it
+  cannot re-verify within budget to a visible full run, and records what it verified in an attested
+  state. A GitHub workflow template keeps that state on `mutation-state/{inc,full}` branches. The
+  release was proven locally against real StrykerJS 10 and Vitest 4, including a check that every
+  incremental kill equals a fresh one.
+- **Mutation evidence freshness gate.** task-done, pr-ready and epic-ready re-derive whether each kill
+  in a `--mutation-report` still describes the code under review, and classify it as verified, stale
+  (with its cause), pending, unbound or unattested. They run in `advisory` or `enforce` mode, and
+  `--mutation-view` gives each view its own findings. Fresh evidence supersedes stale findings
+  instead of "fixing" them.
 
 ## Highlights in 0.12.0
 
@@ -238,7 +255,13 @@ To enforce the review gate with git-native hooks (block an unreviewed `git push`
 metareview setup --install-hooks        # interactive; --yes headless, --dry-run preview, --uninstall-hooks to reverse
 ```
 
-It sets `core.hooksPath` for this clone (non-destructive — it refuses rather than override an existing one).
+It materializes the hook scripts under your data home (`${XDG_DATA_HOME:-~/.local/share}/metareview/git-hooks/<repo-id>/`, so moving a checkout never
+strands them), sets `core.hooksPath` for this clone (non-destructive — it refuses rather than override an existing one) and
+opts this repository into the plugin's Stop-hook gate (`metareview.stopGate=true`). The plugin's Stop hook does
+nothing in a repository that has not opted in, so installing or upgrading the plugin never gates your other
+projects. Upgrading from 0.13.x: re-run `setup --install-hooks` (or `setup --enable-stop-gate`) in each repository
+that should keep the Stop gate; `setup --enable-stop-gate` alone also opts in a repository whose own hook manager
+owns `core.hooksPath`.
 See the "Enforce the review gate" section of [INSTALL.md](INSTALL.md).
 
 ## Works even better with metaswarm!
@@ -355,7 +378,7 @@ Coding agents should treat metareview as a completion gate, not an optional comm
 
 Agents must not say work is done while a blocking finding remains unresolved or while a gate is `NEEDS_REVISION` or `ESCALATED`. They should commit durable review/context artifacts when the repository's artifact policy says to do so, and keep transient `.metareview/findings.jsonl` and `.metareview/runs.jsonl` local.
 
-When configuring `.gitignore` in ordinary project repositories, ignore those transient files with exact file entries. Do not ignore `docs/metareview/` or the whole `.metareview/` directory, because durable learning, calibration, and fallback knowledge can live there (FSM runs under `.metareview/runs/` ignore themselves — nothing to add; `metareview fsm init` warns when `.metareview/runs.jsonl` is not ignored; `docs/metareview/fsm/` export bundles are durable):
+When configuring `.gitignore` in ordinary project repositories, ignore those transient files with exact file entries. Do not ignore `docs/metareview/` or the whole `.metareview/` directory, because durable learning, calibration, and fallback knowledge can live there (FSM runs live in git's common directory, `<git-common-dir>/metareview/runs/` (the main checkout's `.git/metareview/runs/`), so there is nothing to add; `docs/metareview/fsm/` export bundles are durable):
 
 ```gitignore
 .metareview/findings.jsonl

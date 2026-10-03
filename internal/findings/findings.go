@@ -6,11 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/dsifry/metareview/internal/jsonl"
 	"github.com/dsifry/metareview/internal/markdown"
+	"github.com/dsifry/metareview/internal/scope"
 	"github.com/dsifry/metareview/internal/state"
 )
 
@@ -30,6 +32,15 @@ type Options struct {
 	PreviousRunID  string
 	PreviousRunIDs []string
 	ResetRunIDs    []string
+	// MutationEngines are the engines of this run's --mutation-report files, and empty when the run
+	// supplied none, so mutation-freshness rows and their overrides are left alone (spec §6.5).
+	MutationEngines []string
+	// MutationViews are this run's --mutation-view names (spec §11.3). With views, only freshness
+	// rows of those views count as open and may be superseded; without, every freshness row does.
+	MutationViews []string
+	// MutationViewMaps holds, per engine, the view names in the maps of this run's attested reports
+	// of that engine that carry one. An engine is absent when none does; the rename sweep needs it.
+	MutationViewMaps map[string][]string
 }
 
 type Evidence struct {
@@ -51,6 +62,8 @@ type Input struct {
 	Owner              string     `json:"owner,omitempty"`
 	KnowledgeCandidate bool       `json:"knowledgeCandidate,omitempty"`
 	Fingerprint        string     `json:"fingerprint"`
+	// View is the mutation view a freshness finding belongs to (spec §11.3), stored on its row.
+	View string `json:"view,omitempty"`
 }
 
 type Record struct {
@@ -74,6 +87,8 @@ type Record struct {
 	Fingerprint        string     `json:"fingerprint"`
 	Target             any        `json:"target"`
 	FixedInRunID       string     `json:"fixedInRunId,omitempty"`
+	// View is the mutation view of a freshness row (spec §11.3), empty for every other row.
+	View string `json:"view,omitempty"`
 
 	// Process-exception provenance (see override.go). An override is never a fix:
 	// FixedInRunID stays empty.
@@ -88,6 +103,12 @@ type Record struct {
 	UpdatedAt             string `json:"updatedAt"`
 	RepoRoot              string `json:"repoRoot"`
 	GitHead               string `json:"gitHead"`
+	// Branch is the branch the finding was recorded on (#178), empty on a detached HEAD and on rows from before
+	// branches were recorded. With GitHead it scopes the finding to its branch (see ScopedBlocking).
+	Branch string `json:"branch,omitempty"`
+	// RunUpdated is an abandoned FSM run's closure (#179) snapshot: the run's last event when it was requested or
+	// granted. A grant closes the run only while the run is still there — a run resumed since is open again.
+	RunUpdated string `json:"runUpdated,omitempty"`
 }
 
 type Result struct {
@@ -98,6 +119,9 @@ type Result struct {
 }
 
 func Reconcile(root string, run Run, current []Input, options Options) (Result, error) {
+	// The branch in hand first, so its fixed git calls run before the ledger is read (only a legacy row's reachability
+	// check can still ask git inside the read-modify-write, once per distinct head).
+	sc := loadScope(root)
 	path := findingsPath(root)
 	existing, err := readJSONL(path)
 	if err != nil {
@@ -107,6 +131,30 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 	if err != nil {
 		return Result{}, err
 	}
+	// One row per branch (#178). A finding raised again on another branch is that branch's own obligation, never a
+	// transfer: the branch that raised it first still has the defect until a fix reaches it. The branch in hand is the
+	// checkout's (scope.Load), and each rule below asks it one question:
+	//   - mine: the row is this branch's by name (its name, or a former one after a rename) — refreshed in place. No
+	//     other row is ever moved: a branchless row's recorded head is what ties it to the branches that contain it, so
+	//     a review on a throwaway detached commit must not carry it off a branch's history. (Where the scope is unreadable and
+	//     no branch is checked out — outside a repository, or a detached HEAD whose scope git failed to read — every
+	//     row is refreshed as before #178, and none re-stamped; a scope whose branch was read before a later git call
+	//     failed refreshes only the rows it owns, so a transient failure never carries another branch's row away.)
+	//   - blocksHere: the row gates this branch (scope.Classify) — counted in the verdict. A named run deduplicates
+	//     against a branchless row (from before #178, or a detached HEAD) that gates it only when the row's head is one
+	//     of the branch's own past heads (its reflog) — otherwise that row could later fall out of the branch's history
+	//     and leave it with no row of its own — and never re-stamps it; a detached run deduplicates against every row
+	//     that gates it, but a named run whose scope git failed to read only against its own rows — a transient failure
+	//     can at worst add a duplicate, never fold this branch's re-raise into another branch's row (when git cannot
+	//     even read which branch is checked out, the run is taken as detached; every row then still gates it); and a granted override that gates this branch (a
+	//     lower branch's accepted exception) absorbs the re-raise rather than demanding a second grant — only with a
+	//     readable scope, where "gates" means something;
+	//   - a --previous-run chain closes any row it names, whichever branch recorded it — the chain is the explicit
+	//     repair path, so a fix branch, a stacked branch or an epic can close what it inherited or merged, and a
+	//     deleted branch's row is never stranded.
+	branch := sc.Current
+	mine := func(record Record) bool { return sc.Owns(record.Branch) }
+	blocksHere := func(record Record) bool { return sc.Classify(record.Branch, record.GitHead) == scope.InScope }
 	previousRuns := previousRunSet(options)
 	resetRuns := resetRunSet(options)
 	currentFingerprints := map[string]bool{}
@@ -121,10 +169,21 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 		if record.Status == "open" &&
 			record.Fingerprint != "" &&
 			currentFingerprints[record.Fingerprint] &&
-			sameRunTarget(record, run) {
+			sameRunTarget(record, run) &&
+			(mine(record) || !sc.Known() && branch == "") {
 			record.Scope = firstNonEmpty(record.Scope, run.Scope)
 			record.GitHead = firstNonEmpty(run.GitHead, record.GitHead)
+			// Its own row takes the branch's current name, so a rename then a rewrite keeps it.
+			if mine(record) {
+				record.Branch = branch
+			}
 			record.UpdatedAt = now
+		}
+		// Before the fix transition below: a summary is never "fixed", even from a chained run.
+		if supersedesUnreproducedSummary(record, run, currentFingerprints) {
+			record.Status = StatusSuperseded
+			record.UpdatedAt = now
+			record.GitHead = run.GitHead
 		}
 		// override-pending closes here too, not just open. A requested override
 		// that is then genuinely fixed had no way out: the fix transition matched
@@ -136,13 +195,23 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 		// StatusOverridden is deliberately not included: a granted override is an
 		// acknowledged exception, never a fix, and its fixedInRunId stays empty so
 		// post-merge learning can tell the two apart.
+		// A row imported from a committed log (#188) carries that log's target, which no run records the same way, so a
+		// chain naming its run is proof enough of the target.
 		if (previousRuns[record.RunID] || resetFinding(record, run, resetRuns)) &&
-			sameRunTarget(record, run) &&
+			(sameRunTarget(record, run) || previousRuns[record.RunID] && strings.HasPrefix(record.Fingerprint, ImportedFingerprintPrefix)) &&
 			(record.Status == "open" || record.Status == StatusOverridePending) &&
 			record.Fingerprint != "" &&
+			!IsFreshnessFingerprint(record.Fingerprint) &&
 			!currentFingerprints[record.Fingerprint] {
 			record.Status = "fixed"
 			record.FixedInRunID = run.ID
+			record.UpdatedAt = now
+			record.GitHead = run.GitHead
+		}
+		// Never another live branch's row; an orphaned one (its branch merged and deleted) is no branch's, and epic-ready
+		// still reads it across branches, so fresh evidence clears it.
+		if supersedesFreshness(record, run, options, currentFingerprints) && sc.Classify(record.Branch, record.GitHead) != scope.OtherBranch {
+			record.Status = StatusSuperseded
 			record.UpdatedAt = now
 			record.GitHead = run.GitHead
 		}
@@ -151,7 +220,11 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 
 	activeExisting := map[string]bool{}
 	for _, record := range updated {
-		if record.Status != "fixed" && record.Fingerprint != "" && sameRunTarget(record, run) {
+		// Only fingerprints this run raised can be deduplicated; asking blocksHere first would spend git calls on the rest.
+		if record.Status != "fixed" && record.Status != StatusSuperseded && record.Fingerprint != "" &&
+			currentFingerprints[record.Fingerprint] && sameRunTarget(record, run) &&
+			(mine(record) || blocksHere(record) &&
+				(branch == "" || record.Branch == "" && sc.PastHead(record.GitHead) || sc.Known() && record.Status == StatusOverridden)) {
 			activeExisting[record.Fingerprint] = true
 		}
 	}
@@ -160,7 +233,7 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 		if finding.Fingerprint != "" && activeExisting[finding.Fingerprint] {
 			continue
 		}
-		newRecords = append(newRecords, normalize(run, finding, len(newRecords)+1, now))
+		newRecords = append(newRecords, normalize(run, branch, finding, len(newRecords)+1, now))
 	}
 
 	all := append(updated, newRecords...)
@@ -171,12 +244,13 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 		return Result{}, err
 	}
 	activeCurrent := make([]Record, 0, len(current))
-	openFindings := openForRun(all, run)
+	openFindings := slices.DeleteFunc(openForRun(all, run, options), func(r Record) bool { return !blocksHere(r) })
 	for _, record := range all {
 		if record.Status == "open" &&
 			record.Fingerprint != "" &&
 			currentFingerprints[record.Fingerprint] &&
-			sameRunTarget(record, run) {
+			sameRunTarget(record, run) &&
+			blocksHere(record) {
 			activeCurrent = append(activeCurrent, record)
 		}
 	}
@@ -188,10 +262,88 @@ func Reconcile(root string, run Run, current []Input, options Options) (Result, 
 	}, nil
 }
 
+// UnresolvedReviewBlockersPrefix prefixes the fingerprint of pr-ready's "Unresolved review blockers"
+// finding (internal/reviewers). It SUMMARISES other blockers and is re-derived by every pr-ready run.
+const UnresolvedReviewBlockersPrefix = "pr:unresolved-review-blockers:"
+
+// supersedesUnreproducedSummary: an open (or override-pending) "Unresolved review blockers" row for
+// this run's scope and target that this run did not raise again. Ordinary findings close only
+// through the run chain, but this one is a summary of state every run re-reads, so a copy left by
+// a run outside the chain (a standalone re-run at the same head) otherwise stayed open forever and
+// only an override could clear it. Superseded, not fixed: nothing was corrected, the summary is
+// simply no longer true, and learning must not read it as a fix.
+func supersedesUnreproducedSummary(record Record, run Run, currentFingerprints map[string]bool) bool {
+	return strings.HasPrefix(record.Fingerprint, UnresolvedReviewBlockersPrefix) &&
+		(record.Status == "open" || record.Status == StatusOverridePending) &&
+		strings.TrimSpace(record.Scope) == strings.TrimSpace(run.Scope) &&
+		sameRunTarget(record, run) &&
+		!currentFingerprints[record.Fingerprint]
+}
+
 // StatusSuperseded marks a row whose fingerprint an upgrade replaced. It is
 // neither open (so it never blocks) nor fixed (so learning never reads it as a
 // correction), and its fixedInRunId stays empty for the same reason.
 const StatusSuperseded = "superseded"
+
+// freshnessPrefixes are the mutation-freshness findings (spec §6.5). Fresh evidence supersedes
+// them; they are never "fixed", because a refresh is not a correction learning should read.
+var freshnessPrefixes = []string{"mutation:stale:", "mutation:pending:", "mutation:unattested:"}
+
+// IsFreshnessFingerprint reports a mutation-freshness finding.
+func IsFreshnessFingerprint(fingerprint string) bool {
+	for _, prefix := range freshnessPrefixes {
+		if strings.HasPrefix(fingerprint, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// freshnessEngine is the <engine> field of mutation:<kind>:<mode>:<engine>:….
+func freshnessEngine(fingerprint string) string {
+	parts := strings.SplitN(fingerprint, ":", 5)
+	if len(parts) < 4 {
+		return ""
+	}
+	return parts[3]
+}
+
+// supersedesFreshness: this run supplied reports of the row's engine and did not reproduce it, and
+// the row is of one of the run's views (spec §11.3), or of a view that no view map of the run's
+// reports of that engine names any more (the rename sweep).
+func supersedesFreshness(record Record, run Run, options Options, current map[string]bool) bool {
+	engine := freshnessEngine(record.Fingerprint)
+	if len(options.MutationEngines) == 0 || !IsFreshnessFingerprint(record.Fingerprint) ||
+		!slices.Contains(options.MutationEngines, engine) ||
+		(record.Status != "open" && record.Status != StatusOverridePending) ||
+		!sameRunTarget(record, run) || current[record.Fingerprint] || record.RunID == run.ID {
+		return false
+	}
+	names, mapped := options.MutationViewMaps[engine]
+	renamed := record.View != "" && mapped && !slices.Contains(names, record.View)
+	return InViewScope(record, options.MutationViews) || renamed
+}
+
+// InViewScope: a run with --mutation-view owns only the freshness rows of its views (spec §11.3);
+// a run without views owns them all, and every other row is always in scope.
+func InViewScope(record Record, views []string) bool {
+	return len(views) == 0 || !IsFreshnessFingerprint(record.Fingerprint) || slices.Contains(views, record.View)
+}
+
+// OnlyStaleBlockers reports that every open blocking finding is stale mutation evidence (spec §6.8).
+func OnlyStaleBlockers(records []Record) bool {
+	blocking := 0
+	for _, record := range records {
+		if !IsBlockingClass(record) {
+			continue
+		}
+		if !strings.HasPrefix(record.Fingerprint, "mutation:stale:") {
+			return false
+		}
+		blocking++
+	}
+	return blocking > 0
+}
 
 // legacyContextRiskPrefixes are the reason-bearing context-risk fingerprints
 // 0.8.3 replaced with reason-independent ones.
@@ -387,8 +539,9 @@ func readCommittedIndex(path string) ([]byte, error) {
 
 // carryOverLine matches both shapes the index renders — unresolved-blocker bullets
 // ("- mrvf-… [high] Title (reviewer)") and Process Overrides entries ("- mrvf-… [granted] …") —
-// keyed by the leading finding ID, which is unique and stable across worktrees and sessions.
-var carryOverLine = regexp.MustCompile(`^- (mrvf-[A-Za-z0-9-]+) \[`)
+// keyed by the leading finding ID, which is unique and stable across worktrees and sessions — or, for an abandoned FSM
+// run's closure (#179), the run's own ID (mrv-…).
+var carryOverLine = regexp.MustCompile(`^- (mrvf?-[A-Za-z0-9-]+) \[`)
 
 // carryOverLines returns the committed FINDINGS.md's blocker and override lines whose finding
 // IDs the rendering records do not know (issue #151).
@@ -691,12 +844,10 @@ var (
 	seamChmod       = func(name string, mode os.FileMode) error { return os.Chmod(name, mode) }
 )
 
+// UnresolvedBlocking is the unresolved blockers that belong to the branch in hand (#178): see ScopedBlocking.
 func UnresolvedBlocking(root string) ([]Record, error) {
-	records, err := readJSONL(findingsPath(root))
-	if err != nil {
-		return nil, err
-	}
-	return unresolvedBlockingFrom(records), nil
+	blockers, _, err := ScopedBlocking(root)
+	return blockers, err
 }
 
 // All returns every recorded finding regardless of status. The report
@@ -707,7 +858,7 @@ func All(root string) ([]Record, error) {
 	return readJSONL(findingsPath(root))
 }
 
-func normalize(run Run, finding Input, index int, createdAt string) Record {
+func normalize(run Run, branch string, finding Input, index int, createdAt string) Record {
 	owner := finding.Owner
 	if owner == "" {
 		owner = "implementer"
@@ -731,11 +882,13 @@ func normalize(run Run, finding Input, index int, createdAt string) Record {
 		KnowledgeCandidate: finding.KnowledgeCandidate,
 		BeadsFollowupID:    nil,
 		Fingerprint:        finding.Fingerprint,
+		View:               finding.View,
 		Target:             run.Target,
 		CreatedAt:          createdAt,
 		UpdatedAt:          createdAt,
 		RepoRoot:           run.RepoRoot,
 		GitHead:            run.GitHead,
+		Branch:             branch,
 	}
 }
 
@@ -823,10 +976,10 @@ func classForCount(classification, severity string) string {
 	}
 }
 
-func openForRun(records []Record, run Run) []Record {
+func openForRun(records []Record, run Run, options Options) []Record {
 	open := make([]Record, 0, len(records))
 	for _, record := range records {
-		if Blocks(record.Status) && sameRunTarget(record, run) {
+		if Blocks(record.Status) && sameRunTarget(record, run) && InViewScope(record, options.MutationViews) {
 			open = append(open, record)
 		}
 	}

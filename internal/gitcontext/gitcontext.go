@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/dsifry/metareview/internal/baseref"
 )
 
 const maxDiffBytes = 120000
@@ -23,7 +25,10 @@ const maxUntrackedFileBytes = 4000
 var refPattern = regexp.MustCompile(`^[A-Za-z0-9._/@{}^~:-]+$`)
 
 type Context struct {
-	BaseSHA                  string   `json:"baseSha"`
+	BaseSHA string `json:"baseSha"`
+	// RequestedBase is the --base argument as typed ("" for the default base), recorded beside the SHA it
+	// resolved to (#175).
+	RequestedBase            string   `json:"requestedBase,omitempty"`
 	HeadSHA                  string   `json:"headSha"`
 	Branch                   string   `json:"branch"`
 	StatusShort              string   `json:"statusShort"`
@@ -163,6 +168,7 @@ func collect(root, requestedBase string, excludes, exceptions []string) (Context
 	excludedGeneratedFiles := generatedExcludedFiles(root, base, effectiveExcludes, changedFiles, stagedFiles, workingTreeFiles, untrackedFiles)
 	return Context{
 		BaseSHA:                  base,
+		RequestedBase:            requestedBase,
 		HeadSHA:                  head,
 		Branch:                   tryGit(root, "branch", "--show-current"),
 		StatusShort:              tryGit(root, "status", "--short"),
@@ -307,12 +313,24 @@ func resolveBase(root, requestedBase string) (string, error) {
 		if err := validateRef(requestedBase); err != nil {
 			return "", err
 		}
-		base, err := git(root, "rev-parse", "--verify", requestedBase+"^{commit}")
-		if err != nil {
-			return "", fmt.Errorf("invalid git base: %s", requestedBase)
-		}
-		return base, nil
+		// One rule for every command (#175): a branch name resolves to where this work forked from it, an exact
+		// revision to itself — see baseref.
+		return baseref.Resolve(func(args ...string) (string, bool, error) {
+			out, err := git(root, args...)
+			var exit *gitExitError
+			if errors.As(err, &exit) && exit.code == 1 { // git's "no": not a ref, no merge base
+				return "", false, nil
+			}
+			return out, err == nil, err // a timeout or an operational failure aborts
+		}, requestedBase)
 	}
+	base, _, err := defaultBase(root)
+	return base, err
+}
+
+// defaultBase is the base with no --base: the fork point from main, then master (forked=true), else HEAD~1
+// (forked=false) — on the default branch itself, or with neither branch.
+func defaultBase(root string) (base string, forked bool, err error) {
 	// These two run BEFORE the loop, and discarding their errors undid the guard below twice
 	// over: a stuck git burned two more full deadlines before the abort could fire, and — worse —
 	// a timed-out `rev-parse HEAD` left head empty, so `base != head` was trivially true and
@@ -320,11 +338,11 @@ func resolveBase(root, requestedBase string) (string, error) {
 	// check exists to prevent, restored by the very stall the deadline exists to catch.
 	head, err := git(root, "rev-parse", "HEAD")
 	if errors.Is(err, ErrTimeout) {
-		return "", err
+		return "", false, err
 	}
 	branch, err := git(root, "rev-parse", "--abbrev-ref", "HEAD")
 	if errors.Is(err, ErrTimeout) {
-		return "", err
+		return "", false, err
 	}
 	for _, name := range []string{"main", "master"} {
 		base, err := git(root, "merge-base", "HEAD", name)
@@ -334,13 +352,13 @@ func resolveBase(root, requestedBase string) (string, error) {
 			// the synchronous Stop gate for triple the bound it was given — and worse, a repo
 			// slow enough to time out on `merge-base main` but not on `HEAD~1` would resolve the
 			// WRONG base and silently scope the branch to one commit.
-			return "", err
+			return "", false, err
 		}
 		if err != nil || base == "" {
 			continue
 		}
 		if base != head {
-			return base, nil
+			return base, true, nil
 		}
 		// The merge base IS this commit, and the two cases that produce that are opposite.
 		//
@@ -357,16 +375,16 @@ func resolveBase(root, requestedBase string) (string, error) {
 		if branch == name {
 			break
 		}
-		return base, nil
+		return base, true, nil
 	}
-	base, err := git(root, "rev-parse", "HEAD~1")
+	base, err = git(root, "rev-parse", "HEAD~1")
 	if errors.Is(err, ErrTimeout) {
-		return "", err
+		return "", false, err
 	}
 	if err == nil && base != "" {
-		return base, nil
+		return base, false, nil
 	}
-	return "", fmt.Errorf("invalid git base: unable to resolve default base")
+	return "", false, fmt.Errorf("invalid git base: unable to resolve default base")
 }
 
 func validateRef(ref string) error {
@@ -458,10 +476,24 @@ func gitReal(root string, args ...string) (string, error) {
 		if message == "" {
 			message = err.Error()
 		}
-		return "", fmt.Errorf("%s", message)
+		code := -1
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			code = exit.ExitCode()
+		}
+		return "", &gitExitError{message: message, code: code}
 	}
 	return strings.TrimSpace(string(out)), nil
 }
+
+// gitExitError is a failed git command: its stderr as the message, and its exit code (-1 if it never ran), so a
+// caller can tell git's "no" (exit 1: absent ref, no merge base) from an operational failure.
+type gitExitError struct {
+	message string
+	code    int
+}
+
+func (e *gitExitError) Error() string { return e.message }
 
 func tryGit(root string, args ...string) string {
 	out, err := git(root, args...)
@@ -580,4 +612,51 @@ func untrackedExcerpt(rel, text string) string {
 		lines[i] = "+" + line
 	}
 	return "--- " + rel + "\n" + strings.Join(lines, "\n")
+}
+
+// Head returns the commit HEAD names.
+func Head(root string) (string, error) {
+	return git(root, "rev-parse", "HEAD")
+}
+
+// IsAncestor reports whether ancestor is an ancestor of (or equal to) descendant. git's "no" (exit 1) is false; any
+// other failure — an unknown commit, a timeout — is an error.
+func IsAncestor(root, ancestor, descendant string) (bool, error) {
+	_, err := git(root, "merge-base", "--is-ancestor", ancestor, descendant)
+	var exit *gitExitError
+	if errors.As(err, &exit) && exit.code == 1 {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// ForkPoint returns where HEAD forked from main or master, and false when there is no such point (HEAD is on
+// the default branch or reachable from main, or neither branch exists) — the default base's HEAD~1 fallback, or
+// HEAD itself, is never a fork point.
+func ForkPoint(root string) (string, bool, error) {
+	base, forked, err := defaultBase(root)
+	if forked {
+		// HEAD itself (a detached main tip, a branch fast-forwarded into main) is where this work starts, not a
+		// point it forked from: a review over any base would "reach" it.
+		head, headErr := git(root, "rev-parse", "HEAD")
+		if headErr == nil && base != head {
+			return base, true, nil
+		}
+		return "", false, headErr
+	}
+	if errors.Is(err, ErrTimeout) {
+		return "", false, err // a stall aborts; a missing HEAD~1 just means no fork point either
+	}
+	return "", false, nil
+}
+
+// CommitExists reports whether sha names a commit in this repository. git's "no" (exit 1) is false; any other
+// failure is an error.
+func CommitExists(root, sha string) (bool, error) {
+	_, err := git(root, "rev-parse", "--verify", "--quiet", "--end-of-options", sha+"^{commit}")
+	var exit *gitExitError
+	if errors.As(err, &exit) && exit.code == 1 {
+		return false, nil
+	}
+	return err == nil, err
 }

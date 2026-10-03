@@ -19,7 +19,7 @@ Run metareview before claiming completion:
 
 `task-done`, `pr-ready`, and `epic-ready` **require an adjudicated adversarial lens review** (the structural
 checks no longer PASS alone). After the real review, record a HEAD-scoped marker so the gate sees it —
-re-record after any new commit:
+re-record after any new commit other than the gate's own artifacts under `docs/metareview/`:
 
 ```bash
 metareview review record-lenses --scope pr-ready --base <base-ref> \
@@ -27,16 +27,16 @@ metareview review record-lenses --scope pr-ready --base <base-ref> \
 ```
 
 Use `--scope task-done` for task-done and `--scope epic-ready` for epic-ready; `--lenses` is required. The
-marker is scoped to the exact base..HEAD diff — re-record after a new commit or a different `--base`. `--mode
-subagent-adjudicated` requires `--from-run` naming a real FSM run whose init records the same base..head; use
+marker is scoped to the exact base..HEAD diff — re-record after a commit that is not only the gate's own artifacts
+under `docs/metareview/`, or a different `--base`. `--mode subagent-adjudicated` requires `--from-run` naming a real
+FSM run that reviewed the same base..head (its init, or the head its final `clean`/`reviewed` transition passed at); use
 `--mode in-session-emulated` (no `--from-run`) for a self-attested in-session review — it passes but is
 advisory-flagged. `METAREVIEW_ALLOW_MECHANICAL_PASS=1` opts a run out to a structural-only pass.
 
 epic-ready reviews the **integration diff** (base..HEAD, the union of the children's changes) with the roll-up
 as context; drive it with `fsm --workflow epic-review-loop` (lenses apply `rubrics/epic-ready-review-rubric.md`,
-independent of the pr-ready/task-done set). Pass the **identical explicit `--base`** to the gate, the workflow,
-and the recorder — epic-ready's default base is `merge-base(HEAD,main)` while `--base main` is the tip, so a
-mismatch silently wedges the marker. A dirty tree blocks on `working-tree-unattested`; commit first.
+independent of the pr-ready/task-done set). `--base <branch>` resolves to `merge-base(HEAD, <branch>)` and
+`--base <sha|HEAD~n>` to that exact commit, identically in the gate, the workflow and the recorder (#175). A dirty tree blocks on `working-tree-unattested`; commit first.
 
 Use `go run ./cmd/metareview ...` when running from a source checkout without a built `bin/metareview`.
 
@@ -77,6 +77,9 @@ instead of working around it:
   local CLI cannot verify that. Enforce the boundary with whatever authenticates actors in your
   environment when it matters.
 
+A blocker that exists only in a committed review log (no local ledger row) can be overridden too: the command
+imports it, with the other blockers of the logs that list it (#188). An ID found nowhere exits 1. An abandoned FSM run is closed the same way: `override request|grant <run-id>` (#179).
+
 Both halves record actor, timestamp and reason and are rendered under "Process Overrides" in
 `docs/metareview/FINDINGS.md`. An override is never a fix: `fixedInRunId` stays empty, so exceptions can be
 analysed separately from resolutions.
@@ -115,7 +118,7 @@ Keep transient state local:
 
 - `.metareview/findings.jsonl`
 - `.metareview/runs.jsonl`
-- `.metareview/runs/` (FSM runs; self-ignoring, incl. `.torn/`)
+- `<git-common-dir>/metareview/runs/` (FSM runs; the main checkout's `.git/metareview/runs/` — shared by every worktree, never tracked)
 - `.metareview/shards/` (transient prompt packs; self-ignoring)
 - generated binaries such as `bin/metareview`
 

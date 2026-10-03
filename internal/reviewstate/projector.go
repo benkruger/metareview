@@ -574,6 +574,53 @@ func LogResolvedInLedger(log reviewlog.Summary, byID map[string]findings.Record)
 	return !anyBlocking && len(resolvers) > 0
 }
 
+// LogBlockersResolvedInLedger reports whether every BLOCKING finding a log raised is resolved in the
+// ledger — the pr-ready gate's predicate (mr-ik7). Unlike LogResolvedInLedger it is strict only about
+// the ids under the log's "## Blocking Findings" section: an advisory or quoted id the ledger does not
+// hold is not a blocker, so it must not keep the log unresolved forever (which would block a branch on
+// something it cannot act on). The run record's BlockingFindingCount is the tripwire that keeps an
+// unknown BLOCKER from being skipped: fewer vouched blockers than the run raised means one is
+// unaccounted for (unknown to the ledger, or pruned from the markdown). A log with no BlockingFindingIDs
+// (no such section — an artifact log, or a legacy log) falls back to the strict LogResolvedInLedger, so
+// nothing is cleared on a missing parse.
+func LogBlockersResolvedInLedger(log reviewlog.Summary, byID map[string]findings.Record) bool {
+	if len(log.BlockingFindingIDs) == 0 {
+		return LogResolvedInLedger(log, byID)
+	}
+	if !log.HasUnresolvedBlockers {
+		return false
+	}
+	// A blocker-class row the ledger KNOWS is still blocking keeps the log blocking, wherever the log
+	// lists it (the blocking section, or a carried-forward id in FindingIDs).
+	if _, anyBlocking := ClassifyReviewFindings(log.FindingIDs, byID); anyBlocking {
+		return false
+	}
+	vouched := 0
+	for _, id := range log.BlockingFindingIDs {
+		record, ok := byID[id]
+		if !ok {
+			return false // a blocking id the ledger does not know is an unvouched blocker
+		}
+		if !findings.IsBlockingClass(record) {
+			continue // listed under Blocking Findings, but classed advisory: it never held the gate
+		}
+		if findings.Blocks(record.Status) {
+			return false
+		}
+		if !findings.IsResolvedTerminal(record.Status) {
+			return false // an unrecognized status is unvouched, never resolved
+		}
+		vouched++
+	}
+	if vouched == 0 {
+		return false
+	}
+	if log.BlockingFindingCount > 0 && vouched < log.BlockingFindingCount {
+		return false
+	}
+	return true
+}
+
 // EscalationLiftedByOverrides reports whether an ESCALATED log's hard stop is lifted by
 // an explicit recorded human decision: EVERY blocker-class finding it references carries
 // an override grant (grantor recorded). Fixes and superseded rows never lift an
@@ -648,4 +695,43 @@ func ResolverPhrase(record findings.Record) string {
 		}
 		return "resolved"
 	}
+}
+
+// FlagTargetRunIDs (#187) returns the task-done and epic-ready reviews whose target is exactly --help or -h. Such a
+// log was never a review of work: before #164 made `review task-done --help` print usage, the flag was taken as the
+// target and a real gate run was recorded against it (epic-ready resolved it as an advisory epic id the same way).
+// Its blockers can never be resolved — a run for that target cannot be made again — yet its covered paths made it
+// block every later PR touching them. Only these two are matched: any other dash target (`--verbose`, an omitted
+// target before `--base`) is now refused by the CLI, and a log recorded under one before that was a real review of
+// current work, so it keeps blocking. The verdict is not consulted: an ESCALATED --help run is no more a review.
+// Nor is the local run record: it exists only in the clone that ran the review, so requiring it would leave the
+// artifact blocking everywhere else. The committed log is already the trust surface for every blocker — LogBlocks
+// reads its findings and verdict from the same markdown — so hand-editing its Target is no stronger than editing
+// its findings, and either edit shows in the diff under review.
+// Shared by pr-ready's projection and status so the gate and status agree.
+//
+// This is deliberately the only automatic retirement. Inferring from heads and branches that a review covered
+// someone else's, landed work fails open: task-done also reviews uncommitted changes and records only HEAD, and
+// rebases, renames, detached checkouts and a moving base all defeat the inference. Any other stale blocker is
+// cleared through a human-granted process override, which records who decided and why; making that work for
+// blockers that exist only in committed review logs is tracked in #188.
+func FlagTargetRunIDs(logs []reviewlog.Summary) []string {
+	// Callers retire by run id alone, so an id another log shares (duplicated or hand-authored) would retire that
+	// log too: an ambiguous id is never selected, and both records keep blocking.
+	seen := map[string]int{}
+	for _, log := range logs {
+		seen[log.RunID]++
+	}
+	var ids []string
+	for _, log := range logs {
+		if seen[log.RunID] != 1 {
+			continue
+		}
+		// Exact, untrimmed: the artifacts parse as exactly "--help"/"-h". A padded variant (" --help") was typed on
+		// purpose and may be a real review of current work, so it keeps blocking.
+		if log.RunID != "" && (log.Kind == "task-done" || log.Kind == "epic-ready") && (log.Target == "--help" || log.Target == "-h") {
+			ids = append(ids, log.RunID)
+		}
+	}
+	return ids
 }

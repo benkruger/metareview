@@ -2,7 +2,7 @@
 
 `metareview fsm` runs a workflow (`sdlc-loop`, `review-loop`, or a workflow file of your own) as an audited state
 machine. The machine decides which node comes next, evaluates gates, records every judge call and every command in
-`.metareview/runs/<id>/audit.jsonl`, and stops at safety limits. **The host agent does the work of the host nodes** —
+`<git-common-dir>/metareview/runs/<id>/audit.jsonl` (one store for every worktree, #173), and stops at safety limits. **The host agent does the work of the host nodes** —
 in the session it already has — and hands the result back with `record`. Nothing is re-spawned cold.
 
 The workflow structure is deterministic and the LLM calls are auditable and swappable; the results are not deterministic.
@@ -47,7 +47,7 @@ go to stderr and never carry secrets.
 
 `GATE_FAILED` carries a concrete `resume_hint` — running it forks a child at the checkpoint; use the returned `run_id`.
 `ERR_AUDIT_TORN` means a crash left a torn tail: `advance --repair` moves the fragment to `audit.torn-*.bin` in the run directory
-and continues (`.metareview/runs/.torn/` holds fragments of never-durable runs and of `runs.jsonl`).
+and continues (`<git-common-dir>/metareview/runs/.torn/` holds fragments of never-durable runs and of `runs.jsonl`).
 
 ## Resume is a fork
 
@@ -75,7 +75,7 @@ metareview fsm diff --a <id> --b <child>
 
 ## Escalation
 
-Three non-PASS attempts on one fork lineage make the third leaf `ESCALATED` in `.metareview/runs.jsonl`, and forking it
+Three non-PASS attempts on one fork lineage make the third leaf `ESCALATED` in the store's ledger (`<git-common-dir>/metareview/runs.jsonl`), and forking it
 is refused (`ERR_RUN_ESCALATED`). This is per-lineage: forking an ancestor or running `init` again on the same base is
 a deliberate human reset, not something the agent decides.
 
@@ -99,11 +99,17 @@ a deliberate human reset, not something the agent decides.
 
 ## Files and retention
 
-`.metareview/runs/<id>/` (local, self-ignoring, kept until deleted; `MaxEvents` → `ERR_AUDIT_FULL`),
-`.metareview/runs.jsonl` (one row per terminal run; transient), `docs/metareview/fsm/<id>/` (`fsm export` bundles —
+`<git-common-dir>/metareview/runs/<id>/` (local, inside `.git` so never tracked, kept until deleted; `MaxEvents` → `ERR_AUDIT_FULL`),
+`<git-common-dir>/metareview/runs.jsonl` (one row per terminal run, beside the runs), `docs/metareview/fsm/<id>/` (`fsm export` bundles —
 redacted, one-way, durable). Delete by hand: a run without its `workflow.yaml` sidecar, an incomplete fork
-(`ERR_FORK_INCOMPLETE`), or a directory left behind by `ERR_RUN_LOCKED` at `init`. `metareview status` lists the runs of
-the main worktree. Prerequisite: git ≥ 2.31.
+(`ERR_FORK_INCOMPLETE`), or a directory left behind by `ERR_RUN_LOCKED` at `init`. `metareview status` lists every run in the
+shared store (and any 0.13.x runs not yet migrated); `metareview status --json` — what the Stop hook reads — reports as
+abandoned only the runs of the branch in hand (#177): those `init` recorded for this branch or a name it was renamed
+or copied from (while no live branch holds that name), and those whose head is in `merge-base..HEAD` (a stacked branch inherits its base branch's). A run from before
+#177 (no branch) blocks unless git shows its head belongs nowhere here (out of range, not one of the branch's past
+heads, and unreachable from HEAD or pruned); an empty or unreadable head, or a git failure, keeps it blocking. `init` records the checked-out branch; on a detached HEAD
+pass `--for-branch <branch>` (a local branch). `metareview status --all` also lists the runs that belong to other branches or to none, without
+changing the exit code. Prerequisite: git ≥ 2.31.
 
 ## Escalation
 

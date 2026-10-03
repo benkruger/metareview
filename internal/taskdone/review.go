@@ -3,7 +3,6 @@ package taskdone
 import (
 	"errors"
 	"fmt"
-	"github.com/dsifry/metareview/internal/mutation"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"github.com/dsifry/metareview/internal/reviewlog"
 	"github.com/dsifry/metareview/internal/reviewmanifest"
 	"github.com/dsifry/metareview/internal/reviewstate"
+	"github.com/dsifry/metareview/internal/rollback"
 	"github.com/dsifry/metareview/internal/runchain"
 	"github.com/dsifry/metareview/internal/shardpack"
 	"github.com/dsifry/metareview/internal/state"
@@ -26,6 +26,8 @@ import (
 )
 
 type Options struct {
+	// Incremental marks a review whose Base is a last-reviewed checkpoint (#176); the run records the token.
+	Incremental   bool
 	Base          string
 	PreviousRunID string
 	EvidencePath  string
@@ -38,6 +40,8 @@ type Options struct {
 	// MutationReportPaths are --mutation-report files: a mutation-testing engine's output,
 	// either mutation-testing-report-schema or gremlins JSON. Empty is the ordinary case.
 	MutationReportPaths []string
+	// MutationViews are --mutation-view names (spec §11.3): the evidence is judged per view.
+	MutationViews []string
 	// ShardWriter is the pack-writing seam; nil uses the real filesystem.
 	ShardWriter shardpack.Writer
 }
@@ -62,6 +66,7 @@ type runRecord struct {
 	AttemptNumber        int                 `json:"attemptNumber"`
 	MaxAttempts          int                 `json:"maxAttempts"`
 	BaseSHA              string              `json:"baseSha"`
+	RequestedBase        string              `json:"requestedBase,omitempty"`
 	HeadSHA              string              `json:"headSha"`
 	ContextPath          string              `json:"contextPackPath"`
 	ReviewPath           string              `json:"reviewLogPath"`
@@ -78,11 +83,6 @@ type runRecord struct {
 	UpdatedAt            string              `json:"updatedAt"`
 	RepoRoot             string              `json:"repoRoot"`
 	GitHead              string              `json:"gitHead"`
-}
-
-type fileSnapshot struct {
-	existed bool
-	content []byte
 }
 
 var reviewerNames = []string{"code-quality-reviewer", "security-reviewer", "test-reviewer", "architecture-reviewer"}
@@ -116,6 +116,9 @@ func Create(root, target string, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if options.Incremental {
+		git.RequestedBase = reviewstate.LastReviewedBase
+	}
 	reviewGit := git
 	if len(exceptions) == 0 {
 		reviewGit = filterGeneratedGitContext(git)
@@ -144,10 +147,7 @@ func Create(root, target string, options Options) (Result, error) {
 	runsPath := filepath.Join(root, ".metareview", "runs.jsonl")
 	findingsPath := filepath.Join(root, ".metareview", "findings.jsonl")
 	findingsIndexPath := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
-	snapshots := map[string]fileSnapshot{}
-	for _, path := range []string{contextPath, reviewPath, runsPath, findingsPath, findingsIndexPath} {
-		snapshots[path] = snapshot(path)
-	}
+	snapshots := rollback.GateOutputs(contextPath, reviewPath, runsPath, findingsPath, findingsIndexPath)
 
 	gateEffect := "advisory"
 	if report.Capabilities.Beads || report.Capabilities.Metaswarm {
@@ -161,7 +161,7 @@ func Create(root, target string, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	mutationContext, err := mutationContextFor(options.MutationReportPaths)
+	mutationContext, err := mutationContextFor(root, options.MutationReportPaths, options.MutationViews)
 	if err != nil {
 		return Result{}, err
 	}
@@ -173,7 +173,7 @@ func Create(root, target string, options Options) (Result, error) {
 	// A corrupt runs.jsonl never reaches here silently: the run projection above reads the same file and
 	// fails the whole review loudly with the parse error first (fail-closed). So a read error here can only
 	// mean "no marker" — treat it as absent.
-	if ev, ok, evErr := reviewstate.LatestReviewEvidence(root, "task-done", git.BaseSHA, git.HeadSHA); evErr == nil && ok {
+	if ev, ok, evErr := reviewstate.CurrentReviewEvidence(root, "task-done", git.BaseSHA, git.HeadSHA, gitcontext.ChangedSince(root)); evErr == nil && ok {
 		reviewerCtx.Adversarial.Present = true
 		reviewerCtx.Adversarial.Verdict = ev.AdjudicatedVerdict
 		reviewerCtx.Adversarial.Emulated = ev.IsEmulated()
@@ -189,6 +189,7 @@ func Create(root, target string, options Options) (Result, error) {
 		packRollback, err = packWriter.Write(root, shardPlan, shardpack.Header{
 			Scope:    "task-done",
 			TargetID: task.ID,
+			Target:   target,
 			Base:     reviewGit.BaseSHA,
 			Head:     reviewGit.HeadSHA,
 			Budget:   contextprofile.DefaultMaxBytesPerShard,
@@ -230,9 +231,12 @@ func Create(root, target string, options Options) (Result, error) {
 			previousRunIDs = append(previousRunIDs, link.ID)
 		}
 		reconciled, err := reconcileFindings(root, run, rawFindings, findings.Options{
-			PreviousRunID:  options.PreviousRunID,
-			PreviousRunIDs: previousRunIDs,
-			ResetRunIDs:    chain.ResetRunIDs,
+			PreviousRunID:    options.PreviousRunID,
+			PreviousRunIDs:   previousRunIDs,
+			ResetRunIDs:      chain.ResetRunIDs,
+			MutationEngines:  mutationContext.Engines(),
+			MutationViews:    mutationContext.Views,
+			MutationViewMaps: mutationContext.ViewMaps(),
 		})
 		if err != nil {
 			return err
@@ -253,6 +257,7 @@ func Create(root, target string, options Options) (Result, error) {
 			AttemptNumber:        chain.AttemptNumber,
 			MaxAttempts:          chain.MaxAttempts,
 			BaseSHA:              git.BaseSHA,
+			RequestedBase:        git.RequestedBase,
 			HeadSHA:              git.HeadSHA,
 			ContextPath:          contextRel,
 			ReviewPath:           reviewRel,
@@ -282,10 +287,10 @@ func Create(root, target string, options Options) (Result, error) {
 			FollowUpFindingCount: counts.FollowUp,
 			WarningFindingCount:  counts.Warnings,
 		}
-		return writeFile(reviewPath, []byte(reviewMarkdown(runID, target, contextRel, options.PreviousRunID, gateEffect, verdict, reviewGit.ChangedFiles, reconciled.OpenFindings, reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), meta)), 0o644)
+		return writeFile(reviewPath, []byte(reviewMarkdown(runID, target, contextRel, options.PreviousRunID, gateEffect, verdict, reviewGit.ChangedFiles, reconciled.OpenFindings, joinSections(reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), mutationContext.FreshnessSection), meta)), 0o644)
 	}()
 	if err != nil {
-		restoreSnapshots(snapshots)
+		snapshots.Restore()
 		removeEmptyDirs(root)
 		// The rollback error must not replace the error that caused the rollback.
 		if rollbackErr := packRollback(); rollbackErr != nil {
@@ -527,6 +532,7 @@ func contextMarkdown(runID string, task tasksource.Source, git gitcontext.Contex
 		"## Task\n\n" + task.Body + "\n\n" +
 		"## Git\n\n" +
 		"- Base: " + markdown.InlineCode(git.BaseSHA) + "\n" +
+		markdown.OptionalListItem("Requested base", git.RequestedBase) +
 		"- Head: " + markdown.InlineCode(git.HeadSHA) + "\n" +
 		"- Branch: " + markdown.InlineCode(git.Branch) + "\n" +
 		"- Gate effect: " + markdown.InlineCode(gateEffect) + "\n\n" +
@@ -601,92 +607,9 @@ func reviewMarkdown(runID, target, contextRel, previousRun, gateEffect, verdict 
 		reviewlog.CoveredPathsLabel + " " + markdown.InlineCode(reviewlog.EncodeCoveredPaths(coveredPaths)) + "\n\n" +
 		"## Verdict\n\n" + verdict + "\n\n" + shardedReview +
 		"## Reviewer Results\n\n| Reviewer | Verdict | Blocking | Notes |\n| --- | --- | ---: | --- |\n" +
-		reviewerTable(records) + "\n\n" +
-		findingsMarkdown(records) + "\n" +
+		findings.ReviewerTable(reviewerNames, records) + "\n\n" +
+		findings.ClassifiedMarkdown(records, runID) + "\n" +
 		runChainMarkdown(runID, verdict, meta)
-}
-
-func reviewerTable(records []findings.Record) string {
-	lines := make([]string, 0, len(reviewerNames))
-	for _, reviewer := range reviewerNames {
-		var blockers, nonBlockers []string
-		for _, record := range records {
-			if record.Reviewer != reviewer {
-				continue
-			}
-			counts := findings.CountByClass([]findings.Record{record})
-			if counts.Blocking > 0 {
-				blockers = append(blockers, record.Title)
-			} else {
-				nonBlockers = append(nonBlockers, record.Title)
-			}
-		}
-		verdict := "PASS"
-		note := "No blocking findings."
-		if len(blockers) > 0 {
-			verdict = "NEEDS_REVISION"
-			note = strings.Join(blockers, "; ")
-		} else if len(nonBlockers) > 0 {
-			verdict = "PASS_ADVISORY"
-			note = strings.Join(nonBlockers, "; ")
-		}
-		lines = append(lines, fmt.Sprintf("| %s | %s | %d | %s |", reviewer, verdict, len(blockers), note))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func findingsMarkdown(records []findings.Record) string {
-	return classifiedFindingsMarkdown(records)
-}
-
-func classifiedFindingsMarkdown(records []findings.Record) string {
-	sections := []struct {
-		title string
-		label string
-	}{
-		{title: "## Blocking Findings", label: "blocking"},
-		{title: "## Advisory Findings", label: "advisory"},
-		{title: "## Follow-up Findings", label: "follow-up"},
-		{title: "## Warnings", label: "warning"},
-	}
-	var output []string
-	for _, section := range sections {
-		var items []string
-		for _, record := range records {
-			if classForDisplay(record) != section.label {
-				continue
-			}
-			items = append(items, "### "+record.ID+": "+record.Title+"\n\n"+
-				"- Reviewer: "+record.Reviewer+"\n"+
-				"- Severity: "+record.Severity+"\n"+
-				"- Classification: "+record.Classification+"\n"+
-				"- Finding: "+record.Finding+"\n"+
-				"- Expected: "+record.Expected+"\n"+
-				"- Found: "+record.Found+"\n"+
-				"- Recommendation: "+record.Recommendation+"\n")
-		}
-		body := "No findings in this class.\n"
-		if len(items) > 0 {
-			body = strings.Join(items, "\n")
-		}
-		output = append(output, section.title+"\n\n"+body)
-	}
-	return strings.Join(output, "\n\n")
-}
-
-func classForDisplay(record findings.Record) string {
-	counts := findings.CountByClass([]findings.Record{record})
-	// if/else-if rather than a tagless switch: Go's cover profile emits no counter for a
-	// tagless-switch case expression, so the boundary mutants on these comparisons would be
-	// reported "not covered" and stay unkillable. See the #104/#106 precedent.
-	if counts.Blocking > 0 {
-		return "blocking"
-	} else if counts.Advisory > 0 {
-		return "advisory"
-	} else if counts.FollowUp > 0 {
-		return "follow-up"
-	}
-	return "warning"
 }
 
 func runChainMarkdown(runID, verdict string, meta reviewMetadata) string {
@@ -702,25 +625,6 @@ func runChainMarkdown(runID, verdict string, meta reviewMetadata) string {
 	builder.WriteString("\n## Unresolved Blocker Summary\n\n")
 	fmt.Fprintf(&builder, "- Blocking: %d\n- Advisory: %d\n- Follow-up: %d\n- Warnings: %d\n", meta.BlockingFindingCount, meta.AdvisoryFindingCount, meta.FollowUpFindingCount, meta.WarningFindingCount)
 	return builder.String()
-}
-
-func snapshot(path string) fileSnapshot {
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		return fileSnapshot{existed: false}
-	}
-	return fileSnapshot{existed: true, content: bytes}
-}
-
-func restoreSnapshots(snapshots map[string]fileSnapshot) {
-	for path, snapshot := range snapshots {
-		if snapshot.existed {
-			_ = os.MkdirAll(filepath.Dir(path), 0o755)
-			_ = os.WriteFile(path, snapshot.content, 0o644)
-			continue
-		}
-		_ = os.Remove(path)
-	}
 }
 
 func removeEmptyDirs(root string) {
@@ -791,13 +695,17 @@ func firstNonEmpty(values ...string) string {
 // mutationContextFor loads the declared mutation reports. An unreadable or unrecognised report is
 // an error that stops the review, never a skipped file: a mutation gate that quietly drops a
 // report is a gate that passes because it looked at less.
-func mutationContextFor(paths []string) (reviewers.MutationContext, error) {
-	if len(paths) == 0 {
-		return reviewers.MutationContext{}, nil
+func mutationContextFor(root string, paths, views []string) (reviewers.MutationContext, error) {
+	return reviewers.LoadMutationContext(root, paths, views, "task-done", false)
+}
+
+// joinSections joins the non-empty sections that follow the verdict line.
+func joinSections(sections ...string) string {
+	var kept []string
+	for _, s := range sections {
+		if s != "" {
+			kept = append(kept, s)
+		}
 	}
-	reports, err := mutation.LoadAll(paths)
-	if err != nil {
-		return reviewers.MutationContext{}, err
-	}
-	return reviewers.MutationContext{Reports: reports}, nil
+	return strings.Join(kept, "\n\n")
 }

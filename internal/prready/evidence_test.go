@@ -44,7 +44,7 @@ func TestRenderEvidenceIncludesRequiredSections(t *testing.T) {
 		// to the live gate's own findings, so a clear status can't be misread as the
 		// gate verdict (#135).
 		"### Recorded-Evidence Blocker Status",
-		"findings this gate run raised are under `## Blocking Findings` above.",
+		"findings this gate run raised are in its review log's `## Blocking Findings` section.",
 	} {
 		if !strings.Contains(markdown, required) {
 			t.Fatalf("rendered evidence missing %q:\n%s", required, markdown)
@@ -297,7 +297,10 @@ func TestAttemptSummary(t *testing.T) {
 		{name: "at limit", review: ReviewEvidence{AttemptNumber: 3, MaxAttempts: 3}, want: " attempt 3/3"},
 		{name: "no counters", review: ReviewEvidence{}, want: ""},
 		{name: "zero max", review: ReviewEvidence{AttemptNumber: 5, MaxAttempts: 0}, want: ""},
-		{name: "over limit no note", review: ReviewEvidence{AttemptNumber: 5, MaxAttempts: 3}, want: " attempt 5 (exceeds recorded limit; no override recorded)"},
+		{name: "over limit no note", review: ReviewEvidence{AttemptNumber: 7, MaxAttempts: 3}, want: " attempt 7 (exceeds recorded limit; no override recorded)"},
+		// Spec §6.8: only a chain blocked by stale mutation evidence alone continues past its limit
+		// without an override, and only up to 2 × maxAttempts.
+		{name: "within the stale-evidence allowance", review: ReviewEvidence{AttemptNumber: 5, MaxAttempts: 3}, want: " attempt 5 (over the recorded limit of 3; within the stale mutation evidence allowance of 6)"},
 		{name: "over limit with note", review: ReviewEvidence{AttemptNumber: 5, MaxAttempts: 3, AttemptNote: "override granted by boss"}, want: " attempt 5 (override granted by boss)"},
 	}
 	for _, tc := range cases {
@@ -430,5 +433,17 @@ func TestRenderEvidenceDistinguishesStructuredValidation(t *testing.T) {
 		if !strings.Contains(body, required) {
 			t.Fatalf("expected rendered validation summary %q:\n%s", required, body)
 		}
+	}
+}
+
+// TestReviewListKeepsTaskDoneEvidencePaths is #184's end-to-end criterion: the rendered pr-ready evidence line for
+// a task-done review keeps its review-log path and finding ids intact, so readers can open the evidence. The
+// secret redactor used to turn every "task-done-…" path into an unresolvable "ta[REDACTED]".
+func TestReviewListKeepsTaskDoneEvidencePaths(t *testing.T) {
+	path := "docs/metareview/reviews/mrv-20260831-183207933768000-task-done-mechanical-precision-lens-c79c1389.md"
+	finding := "mrvf-20260831-183207933768000-task-done-mechanical-precision-lens-c79c1389-001"
+	got := reviewList([]ReviewEvidence{{Target: "mechanical-precision-lens", Verdict: "PASS_ADVISORY", Path: path, FindingIDs: []string{finding}}}, "none")
+	if !strings.Contains(got, "("+path+")") || !strings.Contains(got, finding) || strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("rendered evidence line lost its task-done path or finding id: %q", got)
 	}
 }

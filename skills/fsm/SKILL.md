@@ -20,6 +20,8 @@ metareview fsm record node-output --run <id> --node <node> --data <file|->
 metareview fsm advance --run <id>        # repeat until DONE / STOPPED / GATE_FAILED
 ```
 
+`fsm init` takes no review scope, so for an incremental review pass the checkpoint SHA: `--base $(metareview review checkpoint --scope pr-ready)`, and the same `--base last-reviewed` to the gate and `record-lenses`.
+
 - If you do not know where a run is: `metareview fsm state --run <id>` and follow `next_action` (`advance` | `record` | `none`).
 - `advance` is idempotent at `NEEDS_INPUT`: repeating it re-emits the same payload.
 - `exec` in a `NEEDS_INPUT` payload: `inline` = you do it, in this session, with the context you already have — do not
@@ -96,15 +98,15 @@ ratio. A candidate whose file is not in the diff is never judged: it is kept as
 
 ## Files
 
-- `.metareview/runs/<id>/` — the run (audit.jsonl, workflow.yaml, sidecars); local-FS only, self-ignoring, retained
+- `<git-common-dir>/metareview/runs/<id>/` (e.g. `.git/metareview/runs/<id>/`) — the run (audit.jsonl, workflow.yaml, sidecars); shared by every worktree, inside `.git` so never tracked, retained
   until you delete it; `MaxEvents` (`ERR_AUDIT_FULL`) caps a run; a torn tail is repaired by `advance --repair` and the
-  dropped bytes kept as `audit.torn-*.bin` in the run directory (`.metareview/runs/.torn/` holds fragments of runs
+  dropped bytes kept as `audit.torn-*.bin` in the run directory (`<git-common-dir>/metareview/runs/.torn/` holds fragments of runs
   that never became durable and of `runs.jsonl`); delete a run without its sidecar, an incomplete fork
   (`ERR_FORK_INCOMPLETE`) or a directory left by `ERR_RUN_LOCKED` at `init` by hand.
-- `.metareview/runs.jsonl` — one row per terminal run (transient; the existing exact `.gitignore` entry covers it).
+- `<git-common-dir>/metareview/runs.jsonl` — one row per terminal run, beside the runs in git's common directory (the checkout's `.metareview/runs.jsonl` keeps only review/gate rows).
 - `docs/metareview/fsm/<id>/` — `fsm export` bundles (durable; commit them). Exports are one-way; `--include-vars` needs
   an explicit `--out` and that output is never committed; `record.data` events are exported unredacted.
-- `metareview status` lists the FSM runs of the main worktree.
+- `metareview status` lists every FSM run in the shared store (and any 0.13.x runs not yet migrated). Its abandoned-run list — what the Stop hook reads — is scoped to the branch in hand (#177): a run belongs to the branch `fsm init` recorded (the checked-out one; on a detached HEAD pass `--for-branch <branch>`, which must name a local branch — on a branch it may only restate it), and it also blocks any branch whose `merge-base..HEAD` — less what any remote's default branch already has (the branch its `refs/remotes/<remote>/HEAD` names, and its `main`/`master`) — contains its head, so a stacked branch inherits its base branch's runs. Rebase, amend and rename never clear one (a rename is read from the branch's reflog — where no branch reflog is kept, as in a bare repository by default, a rewrite then a rename does), and a failing git blocks everything rather than nothing. Runs of other live branches and of merged-and-deleted ones do not block — unless their head lies in this branch's range (a stacked branch still carries its base's commits); `status --all` (plain or `--json`) lists them grouped by branch and never changes the exit code.
 
 metaswarm repositories: metareview deepens the existing review framework; Beads task state, Superpowers workflows and
 PR shepherding stay where they are. Keep the loop warm: the same session that discovered the bugs fixes them.

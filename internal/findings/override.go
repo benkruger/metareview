@@ -38,6 +38,9 @@ type OverrideRequest struct {
 	Reason     string
 	Escalation string
 	Now        string
+	// Subject is the row to add when neither the ledger nor a committed review log knows the ID: an abandoned FSM run's
+	// closure (#179, AbandonedRunRecord). Nil for a finding.
+	Subject *Record
 }
 
 // OverrideGrant is the acknowledgement from outside the workflow.
@@ -45,6 +48,8 @@ type OverrideGrant struct {
 	By     string
 	Reason string
 	Now    string
+	// Subject is as OverrideRequest's.
+	Subject *Record
 }
 
 // Blocks reports whether a status still holds a gate closed. A pending override
@@ -66,14 +71,19 @@ func RequestOverride(root, findingID string, request OverrideRequest) error {
 	if now == "" {
 		return fmt.Errorf("override request needs a timestamp")
 	}
-	return mutateFinding(root, findingID, func(record *Record) error {
+	return mutateFinding(root, findingID, now, request.Subject, func(record *Record) error {
 		// A FIXED finding enters the two-phase flow only when the request references the
 		// escalation whose hard stop it asks to lift (request.Escalation — issue #147):
 		// the run-level stop can outlive the finding-level fix, and the recorded request
 		// is what makes the later grant two-phase (requester ≠ grantor).
-		fixedWithEscalation := record.Status == "fixed" && strings.TrimSpace(request.Escalation) != ""
-		if record.Status != "open" && !fixedWithEscalation {
+		fixedWithEscalation := (record.Status == "fixed" || supersededFreshness(*record)) && strings.TrimSpace(request.Escalation) != ""
+		reclose := staleClosure(*record, request.Subject)
+		if record.Status != "open" && !fixedWithEscalation && !reclose {
 			return fmt.Errorf("finding %s is %s, not open", findingID, record.Status)
+		}
+		if reclose || IsRunClosure(*record) && request.Subject != nil {
+			record.RunUpdated = request.Subject.RunUpdated
+			record.OverrideGrantedBy, record.OverrideGrantedAt, record.OverrideGrantReason = "", "", ""
 		}
 		record.Status = StatusOverridePending
 		record.OverrideRequestedBy = strings.TrimSpace(request.By)
@@ -108,17 +118,25 @@ func GrantOverride(root, findingID string, grant OverrideGrant) error {
 	if now == "" {
 		return fmt.Errorf("override grant needs a timestamp")
 	}
-	return mutateFinding(root, findingID, func(record *Record) error {
+	return mutateFinding(root, findingID, now, grant.Subject, func(record *Record) error {
 		// A FIXED finding enters the two-phase flow only when a REQUEST referencing the
 		// escalation was already filed (record.OverrideEscalation — issue #147): the
 		// run-level stop can outlive the finding-level fix, and lifting it is the human
 		// decision the grant records — with requester ≠ grantor enforced below.
-		fixedWithEscalation := record.Status == "fixed" && strings.TrimSpace(record.OverrideEscalation) != ""
-		if record.Status != "open" && !fixedWithEscalation && record.Status != StatusOverridePending {
+		fixedWithEscalation := (record.Status == "fixed" || supersededFreshness(*record)) && strings.TrimSpace(record.OverrideEscalation) != ""
+		reclose := staleClosure(*record, grant.Subject)
+		if record.Status != "open" && !fixedWithEscalation && record.Status != StatusOverridePending && !reclose {
 			return fmt.Errorf("finding %s is %s and cannot be overridden", findingID, record.Status)
+		}
+		if reclose {
+			// The run moved on since its last closure: this grant is a new decision, not a second acknowledgement.
+			record.OverrideRequestedBy, record.OverrideRequestedAt, record.OverrideRequestReason = "", "", ""
 		}
 		if strings.EqualFold(by, record.OverrideRequestedBy) {
 			return fmt.Errorf("%s requested this override and cannot also grant it; acknowledgement comes from outside the workflow", by)
+		}
+		if IsRunClosure(*record) && grant.Subject != nil {
+			record.RunUpdated = grant.Subject.RunUpdated // the grant closes the run as it stands now
 		}
 		record.Status = StatusOverridden
 		record.OverrideGrantedBy = by
@@ -161,7 +179,11 @@ func PendingOverrides(root string) ([]Record, error) {
 	return pending, nil
 }
 
-func mutateFinding(root, findingID string, apply func(*Record) error) error {
+// mutateFinding applies an override transition to one ledger row. The blockers of the committed review logs that list the
+// finding and are missing from the ledger — the finding itself, when it exists only in those logs — are imported first
+// (#188), so the escalation path reaches every blocker the gates read and no grant retires a blocker nobody saw; nothing
+// is written unless the transition applies. An ID nothing knows takes subject, when it names that ID.
+func mutateFinding(root, findingID, now string, subject *Record, apply func(*Record) error) error {
 	path := findingsPath(root)
 	records, err := loadRecords(path)
 	if err != nil {
@@ -174,9 +196,24 @@ func mutateFinding(root, findingID string, apply func(*Record) error) error {
 			break
 		}
 	}
-	if index < 0 {
-		return fmt.Errorf("finding %s not found", findingID)
+	known := make(map[string]bool, len(records))
+	for _, record := range records {
+		known[record.ID] = true
 	}
+	imported, err := committedFindings(root, findingID, now, known)
+	if err != nil {
+		return err
+	}
+	if index < 0 && (len(imported) == 0 || imported[0].ID != findingID) {
+		if subject == nil || subject.ID != findingID {
+			return fmt.Errorf("finding %s not found", findingID)
+		}
+		imported = []Record{*subject}
+	}
+	if index < 0 {
+		index = len(records)
+	}
+	records = append(records, imported...)
 	if err := apply(&records[index]); err != nil {
 		return err
 	}
@@ -184,6 +221,12 @@ func mutateFinding(root, findingID string, apply func(*Record) error) error {
 		return err
 	}
 	return RenderIndexWithRecords(root, records)
+}
+
+// supersededFreshness: a freshness row that fresh evidence replaced. Like a fixed row, it takes an
+// override only with an escalation, so a stale-only escalation (spec §6.8) can still be lifted.
+func supersededFreshness(record Record) bool {
+	return record.Status == StatusSuperseded && IsFreshnessFingerprint(record.Fingerprint)
 }
 
 // overrideLines renders the process-exception section of the findings index.
@@ -201,6 +244,11 @@ func overrideLines(records []Record) []string {
 		case StatusOverridePending:
 			lines = append(lines, withEscalation(fmt.Sprintf("- %s [pending] %s — requested by %s at %s: %s",
 				record.ID, title, reqBy, reqAt, reqReason), record))
+		case StatusSuperseded:
+			if record.OverrideRequestedBy != "" {
+				lines = append(lines, withEscalation(fmt.Sprintf("- %s [superseded] %s — requested by %s at %s: %s",
+					record.ID, title, reqBy, reqAt, reqReason), record))
+			}
 		case StatusOverridden:
 			detail := fmt.Sprintf("- %s [granted] %s — granted by %s at %s: %s",
 				record.ID, title, grantedBy, grantedAt, singleLine(record.OverrideGrantReason))
@@ -223,4 +271,47 @@ func withEscalation(detail string, record Record) string {
 		return detail
 	}
 	return detail + fmt.Sprintf(" [escalation: %s]", singleLine(record.OverrideEscalation))
+}
+
+// AbandonedRunFingerprintPrefix marks the ledger row that closes an abandoned FSM run (#179).
+const AbandonedRunFingerprintPrefix = "fsm:abandoned-run:"
+
+// AbandonedRunRecord is the ledger row through which an abandoned FSM run is closed (#179): the run's ID, taken through
+// the ordinary override flow — a request does not close it, the requester cannot grant it, a grant needs a reason — and
+// rendered under Process Overrides. It is bookkeeping, not a finding: advisory, so no review gate counts it, while the
+// run itself keeps blocking `status` until the grant. Branch and head are the run's own (its init), so the row is
+// scoped with the run. updated is the run's last event: a grant closes the run only while it is still there.
+func AbandonedRunRecord(runID, description, branch, head, updated, now string) Record {
+	return Record{
+		SchemaVersion:  1,
+		ID:             runID,
+		RunID:          runID,
+		Scope:          "fsm-run",
+		Reviewer:       "fsm",
+		Severity:       "low",
+		Classification: "advisory",
+		Status:         "open",
+		Title:          "Abandoned FSM run " + description,
+		Fingerprint:    AbandonedRunFingerprintPrefix + runID,
+		Target:         map[string]string{"type": "fsm-run", "id": runID},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		GitHead:        head,
+		Branch:         branch,
+		RunUpdated:     updated,
+	}
+}
+
+// IsRunClosure reports whether a ledger row is an abandoned FSM run's closure row.
+func IsRunClosure(record Record) bool {
+	return strings.HasPrefix(record.Fingerprint, AbandonedRunFingerprintPrefix) && record.ID == strings.TrimPrefix(record.Fingerprint, AbandonedRunFingerprintPrefix)
+}
+
+// staleClosure reports whether record is a run closure (#179), granted or requested, whose run has moved on since —
+// resumed, and left again — so it may be requested or granted afresh: the old grant no longer closes the run (without
+// this the row could never be reopened), and an old request no longer describes it, so a grant is taken as a fresh,
+// direct decision on the run as it now stands rather than as the acknowledgement of a request about another state.
+func staleClosure(record Record, subject *Record) bool {
+	return IsRunClosure(record) && (record.Status == StatusOverridden || record.Status == StatusOverridePending) &&
+		subject != nil && subject.ID == record.ID && subject.RunUpdated != record.RunUpdated
 }

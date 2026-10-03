@@ -60,7 +60,7 @@ func TestReviewMarkdownSeparatesNonBlockingFindings(t *testing.T) {
 
 func TestVerdictForNonBlockingFindingsIsPassAdvisory(t *testing.T) {
 	counts := findings.ClassCounts{Advisory: 1, FollowUp: 1}
-	verdict, status, blocking, reason := verdictForCounts(counts, "gate", 1, 3)
+	verdict, status, blocking, reason := verdictForCounts(counts, "gate", 1, 3, false)
 	if verdict != "PASS_ADVISORY" || status != "passed" || blocking || reason != "" {
 		t.Fatalf("non-blocking findings must produce PASS_ADVISORY, got verdict=%s status=%s blocking=%v reason=%q", verdict, status, blocking, reason)
 	}
@@ -111,6 +111,12 @@ func TestCreateReusesAuthenticatedUnchangedVerdictWithoutReviewerInvocation(t *t
 		return original(ctx)
 	}
 	t.Cleanup(func() { runPRReadyReviewers = original })
+	// An open blocker of another branch (#178) is listed on the reused path too.
+	savedScoped := scopedBlocking
+	t.Cleanup(func() { scopedBlocking = savedScoped })
+	scopedBlocking = func(string) ([]findings.Record, []findings.Record, error) {
+		return nil, []findings.Record{{ID: "mrvf-other-001", Status: "open", Classification: "blocking", Severity: "high"}}, nil
+	}
 
 	first, err := Create(root, Options{Base: "main", EvidencePath: evidence, Now: time.Date(2026, 9, 3, 1, 0, 0, 0, time.UTC)})
 	if err != nil {
@@ -132,6 +138,9 @@ func TestCreateReusesAuthenticatedUnchangedVerdictWithoutReviewerInvocation(t *t
 	}
 	if !strings.Contains(string(body), "Reused verdict from: `"+first.RunID+"`") {
 		t.Fatalf("reused review does not name its source:\n%s", body)
+	}
+	if !strings.Contains(string(body), "Open on other branches: 1 ") {
+		t.Fatalf("reused review does not list the other branch's open blocker:\n%s", body)
 	}
 }
 
@@ -204,6 +213,31 @@ func TestGateReviewLogsKeepsOpenCurrentAndPRLinkedFindings(t *testing.T) {
 		}
 	}
 	t.Fatalf("open current and PR-linked findings must block PR-ready: %+v", results)
+}
+
+func TestGateReviewLogsKeepsUnknownBlockers(t *testing.T) {
+	logs := []reviewlog.Summary{
+		// A BLOCKING id the ledger does not know keeps the log a gate input, even though the blocker the
+		// ledger DOES know is resolved (#188/mr-ik7).
+		{Target: "TASK-mixed", Verdict: "NEEDS_REVISION", HasUnresolvedBlockers: true,
+			FindingIDs:         []string{"mrvf-known-001", "mrvf-unknown-001"},
+			BlockingFindingIDs: []string{"mrvf-known-001", "mrvf-unknown-001"}, BlockingFindingCount: 2},
+		// An ADVISORY id the ledger does not know must NOT block: the log's blocker is resolved.
+		{Target: "TASK-advisory", Verdict: "NEEDS_REVISION", HasUnresolvedBlockers: true,
+			FindingIDs:         []string{"mrvf-known-001", "mrvf-advisory-001"},
+			BlockingFindingIDs: []string{"mrvf-known-001"}, BlockingFindingCount: 1},
+		// Every blocker known AND resolved: retired.
+		{Target: "TASK-clean", Verdict: "NEEDS_REVISION", HasUnresolvedBlockers: true,
+			FindingIDs:         []string{"mrvf-known-001"},
+			BlockingFindingIDs: []string{"mrvf-known-001"}, BlockingFindingCount: 1},
+	}
+	ledger := []findings.Record{
+		{ID: "mrvf-known-001", Status: "fixed", Classification: "blocking", Severity: "high"},
+	}
+	got := gateReviewLogs(logs, ledger)
+	if len(got) != 1 || got[0].Target != "TASK-mixed" {
+		t.Fatalf("only the log with a ledger-unknown BLOCKER must stay a gate input: %+v", got)
+	}
 }
 
 func TestChangedReviewerInputsStartFreshReview(t *testing.T) {

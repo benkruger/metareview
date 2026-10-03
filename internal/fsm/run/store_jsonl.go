@@ -13,17 +13,27 @@ import (
 	"time"
 )
 
-// jsonlStore is the on-disk RunStore: <root>/.metareview/runs/<id>/audit.jsonl (§5).
+// jsonlStore is the on-disk RunStore: <root>/<layout...>/<id>/audit.jsonl (§5). layout is .metareview/runs under a
+// checkout (NewJSONLStore) or metareview/runs under git's common directory (NewCommonDirStore, #173).
 type jsonlStore struct {
-	root string
-	opts Options
-	mu   sync.Mutex
-	held map[string]*os.File // locks issued by this process
+	root   string
+	layout []string
+	opts   Options
+	mu     sync.Mutex
+	held   map[string]*os.File // locks issued by this process
 }
 
 // NewJSONLStore returns the on-disk store rooted at the repository root.
 func NewJSONLStore(root string, opts Options) RunStore {
-	return &jsonlStore{root: root, opts: opts, held: map[string]*os.File{}}
+	// root: store — a checkout's .metareview/runs (the 0.13.x layout; production uses NewCommonDirStore).
+	return &jsonlStore{root: root, layout: []string{".metareview", "runs"}, opts: opts, held: map[string]*os.File{}}
+}
+
+// NewCommonDirStore returns the shared on-disk store under git's common directory: <common>/metareview/runs/<id>/
+// (#173) — one store for the main checkout and every linked worktree, independent of any one checkout.
+func NewCommonDirStore(common string, opts Options) RunStore {
+	// root: store (git's common directory)
+	return &jsonlStore{root: common, layout: []string{"metareview", "runs"}, opts: opts, held: map[string]*os.File{}}
 }
 
 func (s *jsonlStore) Root() string { return s.root }
@@ -54,7 +64,8 @@ func (s *jsonlStore) TornFiles(runID string) ([]TornFile, error) {
 	return out, nil
 }
 
-func (s *jsonlStore) runsDir() string { return filepath.Join(s.root, ".metareview", "runs") }
+// root: store — the run store; s.root is the CLI's storeRoot.
+func (s *jsonlStore) runsDir() string { return filepath.Join(append([]string{s.root}, s.layout...)...) }
 
 func (s *jsonlStore) runDir(id string) string { return filepath.Join(s.runsDir(), id) }
 
@@ -98,21 +109,31 @@ func (s *jsonlStore) validate(id string) error {
 	if err := ValidateRunID(id); err != nil {
 		return storeErrf(CodeStorePath, 0, err.Error())
 	}
-	return s.checkComponents(".metareview", "runs", id)
+	return s.checkComponents(append(append([]string{}, s.layout...), id)...) // root: store
 }
 
-// ensureRuns creates .metareview/runs (0700) and its self-ignoring .gitignore (temp + rename).
+// ensureRuns creates .metareview/runs (0700) and its self-ignoring .gitignore (temp + rename). The temp name is
+// unique to the writer: concurrent first runs in several worktrees all ensure it at once (#180), and with one
+// shared name one writer's rename took the other's temp file away ("no such file or directory"). A temp left by a
+// failed rename is inside runs/, which ignores everything.
 func (s *jsonlStore) ensureRuns() error {
 	err := os.MkdirAll(s.runsDir(), 0o700)
 	gi := filepath.Join(s.runsDir(), ".gitignore")
 	if cur, rerr := os.ReadFile(gi); err == nil && rerr == nil && string(cur) == "*\n" {
 		return nil
 	}
+	var f *os.File
 	if err == nil {
-		err = os.WriteFile(gi+".tmp", []byte("*\n"), 0o600)
+		f, err = os.CreateTemp(s.runsDir(), ".gitignore.tmp-*") // 0600, and a name no other writer has
 	}
 	if err == nil {
-		err = os.Rename(gi+".tmp", gi)
+		_, err = f.WriteString("*\n")
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), gi)
 	}
 	return pathErr(0, err)
 }
@@ -304,7 +325,7 @@ func truncateTo(path string, offset int64) error {
 }
 
 func (s *jsonlStore) List() ([]RunSummary, error) {
-	if err := s.checkComponents(".metareview", "runs"); err != nil {
+	if err := s.checkComponents(s.layout...); err != nil { // root: store
 		return nil, err
 	}
 	entries, err := os.ReadDir(s.runsDir())

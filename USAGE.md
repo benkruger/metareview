@@ -156,6 +156,9 @@ Coverage tells you what *ran*; it does not tell you what's *tested*. metareview 
   `metareview review task-done <target> --base <ref> --mutation-report <file>` (gremlins JSON for Go; the
   Stryker schema for TS; mutmut for Python). A run whose mutation summary is dishonest (e.g. timeouts
   scored as kills) is refused rather than trusted.
+- **Change-driven StrykerJS runs.** For TypeScript/JavaScript projects, the mutation-incremental harness
+  re-runs only what a change can affect and attests exactly what it verified, so a one-line edit does not
+  cost a full mutation run. See [docs/mutation-harness.md](docs/mutation-harness.md).
 - **Coverage gate.** The repo ships a Go-native coverage gate (`make cover`) that holds critical packages
   at 100% of statements and floors the rest, so coverage can only ratchet up.
 
@@ -247,14 +250,24 @@ from *outside* the workflow — the actor who requested an override cannot grant
 with actor, timestamp, and reason, and an override is never a fix — so post-merge learning can analyze
 exceptions separately from resolutions.
 
+The same commands close an **abandoned FSM run** that should no longer block: pass the run's ID in place of a
+finding ID (`metareview override request <run-id> …`, then another actor's `grant`). A request alone leaves the run
+blocking `status`; once granted, the run stops blocking every branch of this checkout and `metareview status --all`
+lists it as closed, with who closed it and why. The closure lives in the checkout's findings ledger, so a run granted
+in one worktree still blocks in another until it is closed there too. A run resumed after its grant blocks again. `fsm record stopped` only
+annotates a run and never removes it.
+
+A blocker that exists only in a committed review log can be overridden too: the command imports it from the logs
+that list it, together with their other blockers. An ID found nowhere exits 1.
+
 ---
 
 ## Where output lives
 
 - **Durable, commit these:** Markdown reviews and context under `docs/metareview/` (including FSM export
   bundles under `docs/metareview/fsm/` and shard results under `docs/metareview/shards/`).
-- **Transient, keep local:** `.metareview/findings.jsonl`, `.metareview/runs.jsonl`, FSM runs under
-  `.metareview/runs/` (self-ignoring), and shard prompt packs under `.metareview/shards/` (self-ignoring).
+- **Transient, keep local:** `.metareview/findings.jsonl`, `.metareview/runs.jsonl`, FSM runs in git's
+  common directory (`<git-common-dir>/metareview/runs/` — the main checkout's `.git/metareview/runs/`; never tracked), and shard prompt packs under `.metareview/shards/` (self-ignoring).
 
 Ignore only the two transient files by exact name — never the whole `docs/metareview/` or `.metareview/`
 directories:

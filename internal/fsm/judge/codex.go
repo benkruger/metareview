@@ -38,7 +38,7 @@ type codexJudge struct {
 	exec           CodexExec
 	nonce          func() string
 	clock          Clock
-	workDir        string        // empty: inherit the caller's directory
+	workDir        string        // empty: a fresh isolated directory per attempt (isolatedDir)
 	attemptTimeout time.Duration // zero: the AttemptTimeout default
 }
 
@@ -66,11 +66,21 @@ func (j *codexJudge) Call(ctx context.Context, r Request) (v Verdict, err error)
 
 	args := []string{
 		"exec", "--json",
+		"--ephemeral",            // a judge call is not a session: persist nothing (one fresh dir per attempt)
 		"--sandbox", "read-only", // a judge reads; it must never edit the tree it is judging
 		"--skip-git-repo-check", // judging is not tied to a repository
 		"--color", "never",
 		"-m", wireModel(r.Model),
 		"-c", "model_reasoning_effort=" + r.Effort,
+		// AGENTS.md is read from the working directory up and would be spliced into the judge's
+		// instructions. The default directory is isolated and empty, but an explicit work dir is a
+		// materialized copy of the change under review, which can carry one: project docs off.
+		"-c", "project_doc_max_bytes=0",
+		// The user's hooks and plugins run in every codex session, this one included: a Stop hook that
+		// blocked after the verdict made the judge answer again with the hook's notice as its reasoning
+		// (#193). The -c form, unlike --disable, is accepted by a CLI that does not know the feature.
+		"-c", "features.hooks=false",
+		"-c", "features.plugins=false",
 		"-", // the prompt arrives on stdin, never as an argv the process table would show
 	}
 	// The same attempt ceiling, per-attempt deadline and backoff as the HTTP arm.
@@ -98,11 +108,22 @@ func (j *codexJudge) Call(ctx context.Context, r Request) (v Verdict, err error)
 			case <-j.clock.After(backoff(classBackoff, attempt-1)):
 			}
 		}
-		actx, cancel := context.WithTimeout(ctx, j.timeout())
-		stdout, code, execErr := j.exec(actx, j.workDir, args, prompt)
-		cancel()
+		dir, cleanup := j.workDir, func() {}
+		if dir == "" {
+			var dirErr error
+			if dir, cleanup, dirErr = isolatedDir(); dirErr != nil {
+				lastErr = errs.E(CodeJudgeTransport, "codex could not be given an isolated working directory: "+dirErr.Error(), "provider", "codex")
+				continue
+			}
+		}
+		stdout, code, execErr := func() ([]byte, int, error) {
+			defer cleanup() // deferred: a panic in the seam must not leave the directory behind
+			actx, cancel := context.WithTimeout(ctx, j.timeout())
+			defer cancel()
+			return j.exec(actx, dir, args, prompt)
+		}()
 
-		text, tokens, found := parseCodexEvents(stdout)
+		texts, tokens, found := parseCodexEvents(stdout)
 		v.Tokens = v.Tokens.Add(tokens)
 		switch {
 		case execErr != nil:
@@ -112,12 +133,33 @@ func (j *codexJudge) Call(ctx context.Context, r Request) (v Verdict, err error)
 		case !found:
 			lastErr = errs.E(CodeJudgeResponse, "codex produced no agent message", "provider", "codex")
 		default:
+			text := texts[len(texts)-1]
 			v.Raw = text
 			v.Parsed, v.Decision, v.Confidence, v.ParseError = Parse(r.Kind, text)
-			return v, nil
+			if !continuedPastVerdict(r.Kind, texts) {
+				return v, nil
+			}
+			// Something spoke after the judge had answered, and the turn went on to another answer: a
+			// verdict that answers the interruption, not the finding (#193). Retried; if every attempt
+			// continues, it is returned as unparseable, which every caller treats fail-closed.
+			capped, _ := run.CapText(text, run.MaxShort)
+			v.Parsed, v.Decision, v.Confidence = nil, r.Kind == KindStillPresent, 0
+			v.ParseError = "the turn continued past a complete verdict (a hook or plugin spoke in the judge's session); raw: " + capped
+			lastErr = nil
 		}
 	}
 	return v, lastErr
+}
+
+// continuedPastVerdict reports whether an agent message before the last one was already a complete verdict.
+// Commentary ahead of a tool call is not one, so a judge that narrates and then answers is a single answer.
+func continuedPastVerdict(kind string, texts []string) bool {
+	for _, text := range texts[:len(texts)-1] {
+		if _, _, _, perr := Parse(kind, text); perr == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // validateCodex is validate's codex arm: no key, and the CLI's wider effort set.
@@ -153,11 +195,11 @@ type codexEvent struct {
 	} `json:"usage"`
 }
 
-// parseCodexEvents pulls the last agent message and the turn's token usage out
+// parseCodexEvents pulls every agent message, in order, and the turn's token usage out
 // of the event stream. A line that is not JSON is ignored rather than fatal:
 // the stream is a CLI's stdout, and a future version may add lines this build
 // does not know.
-func parseCodexEvents(stdout []byte) (text string, tokens run.TokenTotals, found bool) {
+func parseCodexEvents(stdout []byte) (texts []string, tokens run.TokenTotals, found bool) {
 	for _, line := range strings.Split(string(stdout), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -170,7 +212,7 @@ func parseCodexEvents(stdout []byte) (text string, tokens run.TokenTotals, found
 		switch ev.Type {
 		case "item.completed":
 			if ev.Item.Type == "agent_message" {
-				text, found = ev.Item.Text, true
+				texts, found = append(texts, ev.Item.Text), true
 			}
 		case "turn.completed":
 			// input_tokens is the whole prompt with cached_input_tokens a subset of it, and
@@ -187,7 +229,7 @@ func parseCodexEvents(stdout []byte) (text string, tokens run.TokenTotals, found
 			}
 		}
 	}
-	return text, tokens, found
+	return texts, tokens, found
 }
 
 // itoa avoids pulling strconv in for two call sites.

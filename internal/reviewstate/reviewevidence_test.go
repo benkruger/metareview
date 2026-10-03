@@ -151,6 +151,9 @@ func TestReviewEvidenceReadErrorPropagates(t *testing.T) {
 	if _, err := DiscoverReviewEvidence(root); err == nil {
 		t.Fatal("a malformed runs.jsonl must surface a read error")
 	}
+	if _, ok, err := CurrentReviewEvidence(root, "pr-ready", "base", "abc", nil); err == nil || ok {
+		t.Fatal("CurrentReviewEvidence must surface the read error too")
+	}
 	if _, ok, err := LatestReviewEvidence(root, "pr-ready", "base", "abc"); err == nil || ok {
 		t.Fatalf("the read error must propagate (not present-false); ok=%v err=%v", ok, err)
 	}
@@ -169,5 +172,29 @@ func TestRequireAdjudicatedReview(t *testing.T) {
 	t.Setenv("METAREVIEW_ALLOW_MECHANICAL_PASS", "0")
 	if !RequireAdjudicatedReview() {
 		t.Fatal("only the exact value 1 opts out")
+	}
+}
+
+// AC-3.6 (#175): a marker written before requestedBase existed still satisfies the gate when its recorded SHA is the
+// base the gate resolves now; the requested base is audit data and is never matched on.
+func TestPreRequestedBaseMarkersStillMatchOnTheirSHA(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".metareview"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"schemaVersion":1,"kind":"review-evidence","scope":"review-evidence","reviewedScope":"pr-ready","headSha":"head-1","baseSha":"base-1","lensSet":["security"],"adjudicatedVerdict":"PASS","executionMode":"subagent-adjudicated","createdAt":"2026-09-01T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(root, ".metareview", "runs.jsonl"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if m, ok, err := LatestReviewEvidence(root, "pr-ready", "base-1", "head-1"); err != nil || !ok || m.RequestedBase != "" {
+		t.Fatalf("a pre-#175 marker must match on its SHA: ok=%v err=%v %+v", ok, err, m)
+	}
+	// And a new marker's requested base does not narrow what it matches.
+	if err := RecordReviewEvidence(root, ReviewEvidence{ReviewedScope: "task-done", BaseSHA: "base-1", HeadSHA: "head-1",
+		RequestedBase: "main", ExecutionMode: ReviewModeSubagentAdjudicated, AdjudicatedVerdict: "PASS"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := LatestReviewEvidence(root, "task-done", "base-1", "head-1"); !ok {
+		t.Fatal("a marker must match on base..head whatever --base spelling produced it")
 	}
 }

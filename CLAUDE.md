@@ -44,21 +44,26 @@ metareview review record-lenses --scope pr-ready --base <base-ref> \
 
 Use `--scope task-done` for the task-done gate and `--scope epic-ready` for the epic-ready gate. `--lenses` is
 required — name the lenses that actually ran. The marker is scoped to the exact **base..HEAD** diff: re-record
-after any new commit **and** whenever the gate's `--base` differs from the one you reviewed. `--mode
-subagent-adjudicated` requires `--from-run` naming a real FSM run whose init records the same base..head (it
-cannot be hand-typed to fake independent review); for a self-attested in-session review use `--mode
-in-session-emulated` (no `--from-run`), which passes but is flagged advisory. To opt a single run out of the
+after any new commit that changes code, tests or docs **and** whenever the gate's `--base` differs from the one you
+reviewed — committing only the gate's own artifacts (review logs, context packs, shard results, FSM bundles,
+`FINDINGS.md` under `docs/metareview/`) keeps the marker current (#161). `--mode subagent-adjudicated` requires
+`--from-run` naming a real FSM run that reviewed the same base..head: its init, or, for a fix loop, the head at which
+its final `clean`/`reviewed` transition passed, when its last review-lenses node reviewed that very head (mr-1ad). It cannot be hand-typed to fake independent review. For a
+self-attested in-session review use `--mode in-session-emulated` (no `--from-run`), which passes but is flagged
+advisory. To opt a single run out of the
 requirement (structural-only pass), set `METAREVIEW_ALLOW_MECHANICAL_PASS=1`.
 
 **epic-ready specifics.** epic-ready reviews the epic's **integration diff** (base..HEAD — the union of the
 children's changes) with the roll-up (child logs, parent intent) as context; drive it with the
 `epic-review-loop` workflow (`metareview fsm --workflow epic-review-loop --base <base>`), whose lenses apply
-`rubrics/epic-ready-review-rubric.md` — independent of the pr-ready/task-done lens set. **Base-consistency
-rule:** epic-ready's default base is `merge-base(HEAD, main)`, but `record-lenses --base main` resolves the
-*tip* of main; once main advances these differ and the marker will never match. Always pass the **identical
-explicit `--base`** to `review epic-ready`, `fsm --workflow epic-review-loop`, and `record-lenses --scope
-epic-ready`. epic-ready folds the working tree into its reviewed surface, so a dirty tree blocks on
-`working-tree-unattested` even with a valid marker — commit first.
+`rubrics/epic-ready-review-rubric.md` — independent of the pr-ready/task-done lens set. **Base resolution
+(#175):** every command resolves `--base` the same way: a branch name (`main`, `origin/main`) is the point HEAD
+forked from it, `merge-base(HEAD, <branch>)`, and a SHA or revision expression (`a1b2c3d`, `HEAD~2`) is that exact
+commit. So `review epic-ready --base main`, `fsm --workflow epic-review-loop --base main` and `record-lenses
+--scope epic-ready --base main` agree even after main advances. For a long-lived branch, `--base last-reviewed` (task-done,
+epic-ready, pr-ready, record-lenses) reviews only what is new since the last passing review of that scope; `review
+checkpoint --scope <s>` prints that commit, which is what to pass to `fsm init --base`. epic-ready folds the working tree into its
+reviewed surface, so a dirty tree blocks on `working-tree-unattested` even with a valid marker — commit first.
 
 Exit handling: `0` means verify `PASS`/`PASS_ADVISORY` with zero blockers; `1` with a review path means follow that log; nonzero without a path means read stderr. For `metareview fsm`: `3` = the FSM needs the host to do a node's work; `1` + `GATE_FAILED` = run `resume_hint` (it forks a child — a new run id); `1` + `ERR_*` = read `code` (`detail` is data); `2` = nothing was recorded, fix the input and retry unless it is a consent or escalation code, which waits for a human; `STOPPED`/`DONE` are terminal. FSM escalation is per fork lineage: forking an ancestor or re-running `init` on the same base is a human decision.
 
@@ -94,6 +99,8 @@ metareview override list [--pending]
   granting is enforced against the accidental case, not against an actor that misreports itself. Where that
   matters, gate `override grant` behind whatever authenticates actors in your environment (branch
   protection, a CI job with restricted credentials, a review approval).
+- A blocker that exists only in a committed review log (no row in the local ledger — say, a log from another clone)
+  can be overridden too: the command imports it, with the other blockers of the logs that list it (#188). An ID found nowhere exits 1. An abandoned FSM run is closed the same way: `override request|grant <run-id>` (#179).
 - Both halves are recorded with actor, timestamp and reason, rendered under "Process Overrides" in
   `docs/metareview/FINDINGS.md`, and an override is never a fix (`fixedInRunId` stays empty), so post-merge
   learning can analyse exceptions separately from resolutions.
@@ -122,7 +129,7 @@ metareview override list [--pending]
 
 ## Durable Output
 
-Commit Markdown review/context artifacts in `docs/metareview/` (incl. `docs/metareview/fsm/` export bundles and the shard review results in `docs/metareview/shards/`). Keep transient `.metareview/findings.jsonl`, `.metareview/runs.jsonl`, `.metareview/runs/` (FSM runs, self-ignoring) and `.metareview/shards/` (self-ignoring prompt packs) local unless the repository explicitly changes that contract. A `mock: true` FSM row never satisfies a gate.
+Commit Markdown review/context artifacts in `docs/metareview/` (incl. `docs/metareview/fsm/` export bundles and the shard review results in `docs/metareview/shards/`). Keep transient `.metareview/findings.jsonl`, `.metareview/runs.jsonl` and `.metareview/shards/` (self-ignoring prompt packs) local unless the repository explicitly changes that contract. FSM runs live in git's common directory (`<git-common-dir>/metareview/runs/` — the main checkout's `.git/metareview/runs/`, #173), shared by every worktree and never tracked. A `mock: true` FSM row never satisfies a gate.
 
 In metaswarm repositories, use metareview to deepen metaswarm's existing review framework. Do not replace Beads task state, Superpowers workflows, or metaswarm PR shepherding.
 

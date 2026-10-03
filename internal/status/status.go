@@ -15,12 +15,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"github.com/dsifry/metareview/internal/findings"
 	"github.com/dsifry/metareview/internal/repo"
 	"github.com/dsifry/metareview/internal/reviewlog"
 	"github.com/dsifry/metareview/internal/reviewstate"
+	"github.com/dsifry/metareview/internal/scope"
 	"github.com/dsifry/metareview/internal/version"
 )
 
@@ -50,8 +52,17 @@ type Report struct {
 	// Target is the scope this report was built for, empty when it covers everything. A reader
 	// has to be able to tell a clean repository from a clean corner of a blocked one.
 	Target string `json:"target,omitempty"`
-	// Abandoned are FSM runs stopped somewhere that is not an ending.
+	// Abandoned are this branch's FSM runs stopped somewhere that is not an ending (#177: scoped by internal/scope).
 	Abandoned []AbandonedRun `json:"abandoned,omitempty"`
+	// OtherBranchRuns and OrphanedRuns count the abandoned runs that belong to another live branch, or to none. They
+	// never block here; `status --all` lists them in Elsewhere.
+	OtherBranchRuns int `json:"otherBranchRuns,omitempty"`
+	OrphanedRuns    int `json:"orphanedRuns,omitempty"`
+	// ClosedRuns counts the abandoned runs closed by a granted override (#179). They never block; `status --all` lists
+	// them in Elsewhere with who closed them and why.
+	ClosedRuns int `json:"closedRuns,omitempty"`
+	// Elsewhere lists those runs, grouped by branch, when --all asked for them. It never changes the verdict.
+	Elsewhere []AbandonedRun `json:"elsewhere,omitempty"`
 	// Warnings say why an answer may be narrower or wider than asked for — a scope that could
 	// not be resolved reports unscoped rather than empty, and has to say so.
 	Warnings []string `json:"warnings,omitempty"`
@@ -148,6 +159,10 @@ func buildFor(root, target string, current map[string]bool) (Report, error) {
 	if err != nil {
 		return r, err
 	}
+	// A review recorded against the target --help/-h (#187) was never a review of work: it neither blocks nor
+	// answers for the paths it listed. Dropped here, before any scoping, so the target, branch and unscoped reports
+	// all agree with pr-ready, which retires the same runs through the same predicate.
+	logs = dropRuns(logs, reviewstate.FlagTargetRunIDs(logs))
 	// Scoping narrows the whole report, not just must_clear. A document that says
 	// `"target": "t-1"` while listing every other target's reviews invites the reader to think
 	// they are seeing everything, which is the misreading the field exists to prevent.
@@ -218,14 +233,41 @@ func buildFor(root, target string, current map[string]bool) (Report, error) {
 			Kind:    UnreviewedKind,
 		})
 	}
-	r.Abandoned = DiscoverAbandonedRuns(root)
+	r.Abandoned, r.Elsewhere = ScanAbandonedRuns(root)
+	for _, e := range r.Elsewhere {
+		switch e.Scope {
+		case ClosedScope:
+			r.ClosedRuns++
+		case scope.OtherBranch.String():
+			r.OtherBranchRuns++
+		default:
+			r.OrphanedRuns++
+		}
+	}
+	if n := r.OtherBranchRuns + r.OrphanedRuns; n > 0 {
+		r.Warnings = append(r.Warnings, fmt.Sprintf("%d abandoned FSM run(s) belong elsewhere (%d on other branches, %d orphaned); "+
+			"they do not block this branch — "+elsewhereHint, n, r.OtherBranchRuns, r.OrphanedRuns))
+	}
+	if LegacyRunsPending(root) {
+		r.Warnings = append(r.Warnings, "0.13.x FSM runs are still in "+filepath.Join(repo.RunStoreRoot(root), ".metareview", "runs")+
+			"; any `metareview fsm` command migrates them into git's common directory")
+	}
 	for _, a := range r.Abandoned {
 		r.MustClear = append(r.MustClear, Blocker{
-			Target: a.Workflow + " @ " + a.State, RunID: a.RunID, Verdict: VerdictAbandoned, Kind: AbandonedKind,
+			Target: abandonedTarget(a), RunID: a.RunID, Verdict: VerdictAbandoned, Kind: AbandonedKind,
 		})
 	}
 	r.Blocked = len(r.MustClear) > 0
 	return r, nil
+}
+
+// abandonedTarget names an abandoned run for a blocker: its workflow and state, and the branch it was started for
+// (#177 — a stacked branch's blocker must say it came from the branch below).
+func abandonedTarget(a AbandonedRun) string {
+	if a.Branch == "" {
+		return a.Workflow + " @ " + a.State
+	}
+	return a.Workflow + " @ " + a.State + " (branch " + a.Branch + ")"
 }
 
 // AbandonedKind is the Blocker.Kind for an FSM run left mid-flight; UnreviewedKind is the kind for a
@@ -582,7 +624,7 @@ func buildForBranch(root, base string, run RunGit, committedOnly bool) (Report, 
 	// told the loop finished.
 	for _, a := range r.Abandoned {
 		r.MustClear = append(r.MustClear, Blocker{
-			Target: a.Workflow + " @ " + a.State, RunID: a.RunID, Verdict: VerdictAbandoned, Kind: AbandonedKind,
+			Target: abandonedTarget(a), RunID: a.RunID, Verdict: VerdictAbandoned, Kind: AbandonedKind,
 		})
 	}
 	r.Blocked = len(r.MustClear) > 0
@@ -598,20 +640,45 @@ func shortSHA(s string) string {
 
 // EmitForBranch writes the branch-scoped report and returns the process exit code.
 func EmitForBranch(root, base string, run RunGit, w io.Writer) (int, error) {
+	return emitForBranch(root, base, run, w, false)
+}
+
+// elsewhereHint ends the belongs-elsewhere warning of a plain status; elsewhereListed replaces it under --all, which
+// already lists those runs.
+const (
+	elsewhereHint   = "`metareview status --all` lists them with the directory to delete once nobody will finish one"
+	elsewhereListed = "they are listed under `elsewhere`, each with the directory to delete once nobody will finish one"
+)
+
+// EmitForBranchAll is EmitForBranch with every abandoned run listed (`--all`, #177): the exit code is the same.
+func EmitForBranchAll(root, base string, run RunGit, w io.Writer) (int, error) {
+	return emitForBranch(root, base, run, w, true)
+}
+
+func emitForBranch(root, base string, run RunGit, w io.Writer, all bool) (int, error) {
 	r, err := BuildForBranch(root, base, run)
 	if err != nil {
 		return 0, err
 	}
-	return emit(r, w)
+	return emit(r, w, all)
 }
 
 // EmitFor writes the report for one target and returns the process exit code.
 func EmitFor(root, target string, w io.Writer) (int, error) {
+	return emitFor(root, target, w, false)
+}
+
+// EmitForAll is EmitFor with every abandoned run listed (`--all`, #177): the exit code is the same.
+func EmitForAll(root, target string, w io.Writer) (int, error) {
+	return emitFor(root, target, w, true)
+}
+
+func emitFor(root, target string, w io.Writer, all bool) (int, error) {
 	r, err := BuildFor(root, target)
 	if err != nil {
 		return 0, err
 	}
-	return emit(r, w)
+	return emit(r, w, all)
 }
 
 // emit is the one place a Report becomes bytes and an exit code, so every scope answers in the
@@ -621,7 +688,17 @@ func EmitFor(root, target string, w io.Writer) (int, error) {
 // bottom out in the same kinds. What makes encoding/json fail is a channel, a func, a cyclic
 // pointer graph or a failing custom Marshaler, and the type graph contains none, so an error
 // branch here would be unreachable and untestable.
-func emit(r Report, w io.Writer) (int, error) {
+func emit(r Report, w io.Writer, all bool) (int, error) {
+	if !all {
+		r.Elsewhere = nil // the counts stay; the list is --all's
+	} else {
+		// --all was given: point at the list it printed, not at itself (mr-as8).
+		warnings := make([]string, len(r.Warnings))
+		for i, s := range r.Warnings {
+			warnings[i] = strings.Replace(s, elsewhereHint, elsewhereListed, 1)
+		}
+		r.Warnings = warnings
+	}
 	out, _ := json.MarshalIndent(r, "", "  ")
 	if _, err := fmt.Fprintln(w, string(out)); err != nil {
 		return 0, err
@@ -703,4 +780,19 @@ func covers(s reviewlog.Summary, target string, current map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// dropRuns returns logs without the named runs.
+func dropRuns(logs []reviewlog.Summary, ids []string) []reviewlog.Summary {
+	drop := map[string]bool{}
+	for _, id := range ids {
+		drop[id] = true
+	}
+	kept := logs[:0:0]
+	for _, s := range logs {
+		if !drop[s.RunID] {
+			kept = append(kept, s)
+		}
+	}
+	return kept
 }

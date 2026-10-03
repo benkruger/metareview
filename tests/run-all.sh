@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# `setup --install-hooks` materializes hook scripts under the user's data home (#173). No suite may write into the
+# real one: every script below inherits a throwaway XDG_DATA_HOME unless it sets its own.
+XDG_DATA_HOME="$(mktemp -d)"
+export XDG_DATA_HOME
+trap 'rm -rf "$XDG_DATA_HOME"' EXIT
+
 bash tests/manifest/test-manifests.sh
 bash tests/manifest/test-skills.sh
 
@@ -39,6 +45,7 @@ if [ -f tests/go/test-metaswarm-integration.sh ]; then bash tests/go/test-metasw
 if [ -f tests/go/test-pr-evidence.sh ]; then bash tests/go/test-pr-evidence.sh; fi
 if [ -f tests/go/test-prready-reviewers.sh ]; then bash tests/go/test-prready-reviewers.sh; fi
 if [ -f tests/go/test-pr-ready-review.sh ]; then bash tests/go/test-pr-ready-review.sh; fi
+if [ -f tests/go/test-pr-ready-rerun.sh ]; then bash tests/go/test-pr-ready-rerun.sh; fi
 if [ -f tests/go/test-require-adjudicated-review.sh ]; then bash tests/go/test-require-adjudicated-review.sh; fi
 if [ -f tests/go/test-learn-source.sh ]; then bash tests/go/test-learn-source.sh; fi
 if [ -f tests/go/test-session-history.sh ]; then bash tests/go/test-session-history.sh; fi
@@ -49,6 +56,8 @@ if [ -f tests/go/test-learning-render.sh ]; then bash tests/go/test-learning-ren
 if [ -f tests/go/test-learning-writers.sh ]; then bash tests/go/test-learning-writers.sh; fi
 if [ -f tests/go/test-learn-post-merge.sh ]; then bash tests/go/test-learn-post-merge.sh; fi
 if [ -f tests/go/test-fsm.sh ]; then bash tests/go/test-fsm.sh; fi
+bash tests/go/test-fsm-concurrency.sh
+bash tests/go/test-version-skew.sh
 # The Stop hook's ONLY test. run-all.sh is a hand-maintained list, so a new suite that nobody adds
 # here never runs in CI — and this is the suite for the shim the whole enforcement layer rests on.
 # It passed by hand and would have merged untested, which is the same silent failure the hook
@@ -57,6 +66,9 @@ if [ -f tests/go/test-fsm.sh ]; then bash tests/go/test-fsm.sh; fi
 # what let this one be absent from the list without anything noticing. A required suite that
 # silently skips when missing reproduces the exact failure it was added to close.
 bash tests/go/test-stop-hook.sh
+# The SessionStart notice for a missing Stop-gate opt-in (#194) — unguarded for the same reason.
+bash tests/go/test-session-start-check.sh
+bash tests/go/test-bare-layout.sh
 
 # CI runs shellcheck over every *.sh (.github/workflows/test.yml) but run-all.sh did not, so a
 # shell defect could pass the whole local suite and fail CI - which is exactly what happened on

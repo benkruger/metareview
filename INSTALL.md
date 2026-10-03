@@ -111,17 +111,26 @@ metareview setup --install-hooks --force    # override a detected conflict
 metareview setup --uninstall-hooks          # reverse it (only if it is metareview's)
 ```
 
-`--uninstall-hooks` unsets `core.hooksPath` and removes the materialized `.metareview/git-hooks/` scripts, but
+Install also **opts this repository into the Stop-hook gate** by recording `metareview.stopGate=true` in its
+local git config. The plugin registers its Stop hook (`hooks/pre-finish.sh`) in every host session, but the hook
+does nothing — no output, no block — in a repository that has not opted in, so the plugin never gates your other
+projects (#194). Upgrading from 0.13.x, re-run `setup --install-hooks` (or just `setup --enable-stop-gate`) in
+each repository that should keep the Stop gate; the SessionStart notice and `setup --check` (`optedIn`) point
+out a repository whose push gate is installed without the opt-in, and the Stop hook itself says so on stderr.
+A repository whose own hook manager owns `core.hooksPath` (husky, lefthook, beads) — where `--install-hooks`
+refuses rather than override it — opts into the Stop gate alone with `metareview setup --enable-stop-gate`
+(`--disable-stop-gate` reverses it).
+
+`--uninstall-hooks` unsets `core.hooksPath` and the Stop-gate opt-in (the user-level hook dir and `metareview.hooksId` stay, so a reinstall reuses them and nothing another repository may run from is removed), but
 **leaves the `.gitignore` block in place** — editing a user's `.gitignore` on uninstall is riskier than
 leaving inert ignore lines. To remove it, delete the block marked `# metareview: keep ephemeral review state
 local …` from `.gitignore` by hand. Re-running install (or `learn --post-merge`) re-adds it.
 
 With no TTY and no `--yes` (an agent or CI), it prints the plan and the flags and **changes nothing** rather
-than hanging on a prompt. Install **materializes** the hook scripts into `.metareview/git-hooks/` (embedded in
+than hanging on a prompt. Install **materializes** the hook scripts into `${XDG_DATA_HOME:-~/.local/share}/metareview/git-hooks/<repo-id>/` (embedded in
 the binary, so this works in *any* repo — not just metareview's own checkout), points `core.hooksPath` there,
-and adds metareview's **ephemeral-state ignore block** to the repo's `.gitignore` (idempotently) so the
-per-clone scripts *and the rest of metareview's ephemeral state* (`runs.jsonl`, `findings.jsonl`, `runs/`,
-`shards/`) are never committed, while the **durable** learning state (`knowledge/metareview.jsonl`,
+and adds metareview's **ephemeral-state ignore block** to the repo's `.gitignore` (idempotently) so
+metareview's ephemeral state (`runs.jsonl`, `findings.jsonl`, `shards/`) is never committed, while the **durable** learning state (`knowledge/metareview.jsonl`,
 `calibration.jsonl`, `learning-runs.jsonl`) stays committable. Re-running install **refreshes materialized
 hooks whose content has drifted** from the current binary (an upgrade), and `--force` always re-materializes —
 so a hook fix reaches an already-installed repo. Git hooks are per-clone and never auto-install (git's security
@@ -190,7 +199,7 @@ Commit durable Markdown artifacts under `docs/metareview/`, including the shard 
 .metareview/runs.jsonl
 ```
 
-Do not ignore `docs/metareview/` or the whole `.metareview/` directory. FSM runs (`.metareview/runs/`) ignore themselves; `docs/metareview/fsm/` export bundles are durable. `metareview fsm` needs git ≥ 2.31 (`metareview setup --check` reports it).
+Do not ignore `docs/metareview/` or the whole `.metareview/` directory. FSM runs live in git's common directory (`<git-common-dir>/metareview/runs/` — the main checkout's `.git/metareview/runs/`), never tracked; `docs/metareview/fsm/` export bundles are durable. `metareview fsm` needs git ≥ 2.31 (`metareview setup --check` reports it).
 
 ## Judge models and providers
 

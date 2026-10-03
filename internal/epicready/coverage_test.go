@@ -322,66 +322,17 @@ func TestFilterGeneratedHelpers(t *testing.T) {
 }
 
 func TestVerdictForCounts(t *testing.T) {
-	if v, _, blk, r := verdictForCounts(findings.ClassCounts{Blocking: 1}, "gate", 3, 3); v != "ESCALATED" || !blk || r == "" {
+	if v, _, blk, r := verdictForCounts(findings.ClassCounts{Blocking: 1}, "gate", 3, 3, false); v != "ESCALATED" || !blk || r == "" {
 		t.Fatalf("ESCALATED: %q %v %q", v, blk, r)
 	}
-	if v, _, blk, _ := verdictForCounts(findings.ClassCounts{Blocking: 1}, "gate", 1, 3); v != "NEEDS_REVISION" || !blk {
+	if v, _, blk, _ := verdictForCounts(findings.ClassCounts{Blocking: 1}, "gate", 1, 3, false); v != "NEEDS_REVISION" || !blk {
 		t.Fatalf("NEEDS_REVISION: %q %v", v, blk)
 	}
-	if v, _, blk, _ := verdictForCounts(findings.ClassCounts{Advisory: 1}, "gate", 1, 3); v != "PASS_ADVISORY" || blk {
+	if v, _, blk, _ := verdictForCounts(findings.ClassCounts{Advisory: 1}, "gate", 1, 3, false); v != "PASS_ADVISORY" || blk {
 		t.Fatalf("PASS_ADVISORY: %q %v", v, blk)
 	}
-	if v, _, blk, _ := verdictForCounts(findings.ClassCounts{}, "gate", 1, 3); v != "PASS" || blk {
+	if v, _, blk, _ := verdictForCounts(findings.ClassCounts{}, "gate", 1, 3, false); v != "PASS" || blk {
 		t.Fatalf("PASS: %q %v", v, blk)
-	}
-}
-
-func TestClassForDisplay(t *testing.T) {
-	cases := []struct{ classification, severity, want string }{
-		{"blocking", "high", "blocking"},
-		{"advisory", "", "advisory"},
-		{"follow-up", "", "follow-up"},
-		{"warning", "", "warning"},
-	}
-	for _, c := range cases {
-		if got := classForDisplay(findings.Record{Classification: c.classification, Severity: c.severity}); got != c.want {
-			t.Errorf("classForDisplay(%q,%q) = %q, want %q", c.classification, c.severity, got, c.want)
-		}
-	}
-}
-
-func TestRestoreSnapshotsAndRemoveEmptyDirs(t *testing.T) {
-	dir := t.TempDir()
-	existing := filepath.Join(dir, "keep.txt")
-	if err := os.WriteFile(existing, []byte("cur"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	created := filepath.Join(dir, "sub", "new.txt")
-	if err := os.MkdirAll(filepath.Dir(created), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(created, []byte("rm"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	restoreSnapshots(map[string]fileSnapshot{
-		existing: {existed: true, content: []byte("ORIG")},
-		created:  {existed: false},
-	})
-	if got, _ := os.ReadFile(existing); string(got) != "ORIG" {
-		t.Errorf("restore existing: %q", got)
-	}
-	if _, err := os.Stat(created); !os.IsNotExist(err) {
-		t.Errorf("absent-in-snapshot file must be removed")
-	}
-	// removeEmptyDirs prunes the empty docs tree without error.
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "docs", "metareview", "reviews"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	removeEmptyDirs(root)
-	// snapshot of a missing file records existed=false.
-	if s := snapshot(filepath.Join(root, "nope")); s.existed {
-		t.Error("snapshot of a missing file should be existed=false")
 	}
 }
 

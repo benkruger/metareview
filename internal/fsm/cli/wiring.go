@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -19,8 +20,10 @@ import (
 	"github.com/dsifry/metareview/internal/fsm/kind"
 	"github.com/dsifry/metareview/internal/fsm/machine"
 	"github.com/dsifry/metareview/internal/fsm/mockai"
+	"github.com/dsifry/metareview/internal/fsm/record"
 	"github.com/dsifry/metareview/internal/fsm/run"
 	"github.com/dsifry/metareview/internal/fsm/workflow"
+	"github.com/dsifry/metareview/internal/repo"
 )
 
 // Env names the CLI reads (spec 5 §6: the closed set).
@@ -98,25 +101,47 @@ func (c *ctxDeps) removeSandboxes() {
 	c.sandboxRoots = nil
 }
 
-// rootOf resolves the main worktree of cwd (spec 5 §2): the first `worktree` line of `git worktree list --porcelain`;
-// a bare main or a non-repository is ERR_NOT_A_REPO.
-func (c *ctxDeps) rootOf() (string, error) {
+// The FSM resolves three places, and every path it builds must say which one it means (#169, #172, #173):
+//
+//   - commonDir — git's common directory, which holds the shared store (#173): the runs
+//     (<common>/metareview/runs/<id>/), their terminal ledger (<common>/metareview/runs.jsonl; run ids are unique
+//     across it and record.Exists checks it), run listing, and escalation lineage — one store for the main checkout
+//     and every linked worktree, independent of any one checkout.
+//   - storeRoot — the repository anchor: the main worktree, whichever worktree the command runs in (with a bare main,
+//     which has no checkout, the linked worktree the command runs in, #174). It is a run's
+//     RepoRoot (mock scenarios, escalation evidence and export paths resolve against a real checkout), and the
+//     0.13.x store it held (.metareview/runs/) is migrated into commonDir on first use.
+//   - workRoot — the checkout the command runs in: the default work dir a run reviews, and work output meant to be
+//     committed on that checkout's branch, such as a default export bundle.
+//
+// In a single checkout the two coincide. Every .metareview/docs path in internal/fsm carries a `root: store` or
+// `root: work` declaration. TestFSMRootsAreDeclared is a tripwire for that over the literal path forms (split
+// elements and slash-joined strings), not proof: a path assembled any other way is not seen.
+
+// storeRoot resolves the main worktree of cwd (spec 5 §2): the first `worktree` line of `git worktree list --porcelain`.
+// A bare main anchors on the worktree cwd is in (#174); a bare main with no checkout, or a non-repository, is
+// ERR_NOT_A_REPO.
+func (c *ctxDeps) storeRoot() (string, error) {
 	out, code, err := c.git(c.cwd, "worktree", "list", "--porcelain")
 	if err != nil || code != 0 {
 		return "", errs.E(CodeNotARepo, "not inside a git repository", "cwd", c.cwd)
 	}
-	block, _, _ := strings.Cut(out, "\n\n") // the first block is the main worktree; its first line is `worktree <path>`
-	lines := strings.Split(block, "\n")
-	for _, line := range lines {
-		if line == "bare" {
-			return "", errs.E(CodeNotARepo, "the main worktree is bare", "reason", "bare")
+	// Shared with record-lenses' run lookup (repo.RunStoreRoot), so the writer and reader agree (#169).
+	path, bare := repo.MainWorktreeFromPorcelain(out)
+	if bare {
+		// A bare main worktree has no checkout to anchor on (#174). The store itself is in git's common directory
+		// (#173), so a command run from a linked worktree anchors on that worktree; from the bare directory itself
+		// there is no checkout at all.
+		if work, err := c.workRoot(); err == nil {
+			return work, nil
 		}
+		return "", errs.E(CodeNotARepo, "the main worktree is bare", "reason", "bare")
 	}
-	return strings.TrimPrefix(lines[0], "worktree "), nil
+	return path, nil
 }
 
-// toplevel is the current worktree (init's WorkDir default).
-func (c *ctxDeps) toplevel() (string, error) {
+// workRoot is the current worktree (init's WorkDir default, and the default export destination's root).
+func (c *ctxDeps) workRoot() (string, error) {
 	out, code, err := c.git(c.cwd, "rev-parse", "--show-toplevel")
 	if err != nil || code != 0 || out == "" {
 		return "", errs.E(CodeNotARepo, "not inside a git worktree", "cwd", c.cwd)
@@ -124,15 +149,57 @@ func (c *ctxDeps) toplevel() (string, error) {
 	return out, nil
 }
 
-// runsIgnored reports whether .metareview/runs.jsonl is ignored in workDir (git check-ignore exits 0).
-func (c *ctxDeps) runsIgnored(workDir string) bool {
-	_, code, err := c.git(workDir, "check-ignore", "-q", ".metareview/runs.jsonl")
-	return err == nil && code == 0
+// outsideWorkTree reports whether git positively says cwd is not inside a work tree (it prints "false", as it does
+// inside .git). A git failure is not "outside": callers must treat it as an error, not as a reason to fall back.
+func (c *ctxDeps) outsideWorkTree() bool {
+	out, code, err := c.git(c.cwd, "rev-parse", "--is-inside-work-tree")
+	return err == nil && code == 0 && out == "false"
+}
+
+// commonDir resolves git's common directory for cwd (the shared store's home, #173).
+func (c *ctxDeps) commonDir() (string, error) {
+	out, code, err := c.git(c.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil || code != 0 || out == "" {
+		return "", errs.E(CodeNotARepo, "not inside a git repository", "cwd", c.cwd)
+	}
+	return out, nil
+}
+
+// roots resolves the anchor (storeRoot) and the shared store (commonDir), migrating a 0.13.x store from the anchor's
+// .metareview/runs/ into the common directory on the way (#173). The migration is locked and idempotent; what it
+// did is returned as warnings for the envelope — a collision (an id in both places) is reported, never merged.
+func (c *ctxDeps) roots() (root, common string, warns []string, err error) {
+	if root, err = c.storeRoot(); err != nil {
+		return "", "", nil, err
+	}
+	if common, err = c.commonDir(); err != nil {
+		return "", "", nil, err
+	}
+	moved, err := run.MigrateLegacyRuns(root, common)
+	if err != nil {
+		return "", "", nil, err
+	}
+	copied, conflicts, err := record.MigrateLegacyRows(root, common, moved.Collisions...)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if len(moved.Moved) > 0 || len(copied) > 0 {
+		warns = append(warns, fmt.Sprintf("%s: moved %d run(s) and %d ledger row(s) from %s into %s", WarnStoreMigrated,
+			len(moved.Moved), len(copied), filepath.Join(root, ".metareview"), filepath.Join(common, "metareview"))) // root: store (legacy and common)
+	}
+	for _, id := range moved.Collisions {
+		warns = append(warns, fmt.Sprintf("%s: run %s exists in both stores; the 0.13.x copy was left in %s", WarnStoreCollision,
+			id, filepath.Join(root, ".metareview", "runs", id))) // root: store (legacy)
+	}
+	for _, id := range conflicts {
+		warns = append(warns, fmt.Sprintf("%s: the 0.13.x ledger row for %s differs from the store's; it was not copied", WarnStoreCollision, id))
+	}
+	return root, common, warns, nil
 }
 
 // peek reads the first line of a run's audit.jsonl leniently (spec 5 §8: advisory; Open re-verifies everything).
-func (c *ctxDeps) peek(root, runID string) (run.InitData, bool) {
-	raw, err := c.deps.ReadFile(filepath.Join(root, ".metareview", "runs", runID, "audit.jsonl"))
+func (c *ctxDeps) peek(common, runID string) (run.InitData, bool) {
+	raw, err := c.deps.ReadFile(filepath.Join(common, "metareview", "runs", runID, "audit.jsonl")) // root: store (git's common directory)
 	if err != nil {
 		return run.InitData{}, false
 	}
@@ -172,6 +239,9 @@ func (c *ctxDeps) scenarioFor(root string, d run.InitData) (*mockai.Scenario, er
 		return nil, errs.E(CodeRepoRootMismatch, "the run was created in another checkout; mock runs are path-bound", "stored", d.RepoRoot, "root", root)
 	}
 	rel, _, _ := strings.Cut(d.Mock, "#")
+	// Store root, deliberately: a mock run is path-bound to the checkout that created it (the RepoRoot check
+	// above), and its scenario path was recorded relative to that root. Resolving scenarios in the work root
+	// instead would change what a recorded mock path means; see #172's follow-ups.
 	dir := filepath.Join(root, rel)
 	if _, inside := relInside(root, dir); !inside {
 		return nil, errs.E(machine.CodeMockInvalid, "mock scenario must live inside the repository", "dir", rel, "reason", "outside")
@@ -248,7 +318,7 @@ func (c *ctxDeps) escalation(root string, scenario *mockai.Scenario, mode judgeM
 }
 
 // machineDeps builds the per-run machine wiring (spec 5 §8).
-func (c *ctxDeps) machineDeps(root string, scenario *mockai.Scenario, mode judgeMode) (machine.Deps, error) {
+func (c *ctxDeps) machineDeps(root, common string, scenario *mockai.Scenario, mode judgeMode) (machine.Deps, error) {
 	var j judge.Judge
 	real := cmdexec.NewExecRunner()
 	switch {
@@ -269,7 +339,7 @@ func (c *ctxDeps) machineDeps(root string, scenario *mockai.Scenario, mode judge
 	// whose pre-fix failure is not the finding's own symptom.
 	kinds, _ := kind.New(kind.Deps{Judge: j, Mock: scenario != nil, Escalate: c.escalation(root, scenario, mode), RepoSearch: c.repoSearch(root, scenario, mode), Prove: kind.Provers{Mutation: kind.MutationProver{}, Reproduction: kind.ReproductionProver{Exec: d.Exec}}, Symptom: j}) // consistent by construction: a mock judge iff a scenario
 	md := machine.Deps{
-		Store: d.Store(root), Sidecar: d.Sidecar(root), Kinds: kinds,
+		Store: d.Store(common), Sidecar: d.Sidecar(common), Kinds: kinds,
 		Git:      func(dir string) gate.Git { return gate.NewExec(dir, d.Exec) },
 		Runner:   func(r machine.RunnerDeps) converge.Caller { return d.Runner(r, d.Environ, d.FileHash, d.Now, real) },
 		Clock:    func() run.Time { return run.Time{Time: d.Now()} },
@@ -281,8 +351,9 @@ func (c *ctxDeps) machineDeps(root string, scenario *mockai.Scenario, mode judge
 			}
 			return s.Hash(), nil
 		},
-		Terminal: d.Terminal(root, func() run.Time { return run.Time{Time: d.Now()} }),
+		Terminal: d.Terminal(common, func() run.Time { return run.Time{Time: d.Now()} }),
 	}
+	md.EditLock = editLocks(md.Store, d.Now)
 	if scenario == nil && mode == judgeReal {
 		keys := c.keys()
 		md.Preflight = func(n *workflow.Node, calibration bool) error {
@@ -292,8 +363,10 @@ func (c *ctxDeps) machineDeps(root string, scenario *mockai.Scenario, mode judge
 	return md, nil
 }
 
-func (c *ctxDeps) exportDeps(root string, md machine.Deps) export.Deps {
-	return export.Deps{Store: md.Store, Sidecar: md.Sidecar, Kinds: md.Kinds, FS: c.deps.ExportFS, Clock: md.Clock, RepoRoot: root, Home: c.deps.Getenv(EnvHome)}
+// exportDeps binds export to both roots: store for reading the run and relativising its paths, work for where
+// a default bundle is written (the checkout that ran the command).
+func (c *ctxDeps) exportDeps(store, work string, md machine.Deps) export.Deps {
+	return export.Deps{Store: md.Store, Sidecar: md.Sidecar, Kinds: md.Kinds, FS: c.deps.ExportFS, Clock: md.Clock, RepoRoot: store, WorkRoot: work, Home: c.deps.Getenv(EnvHome)}
 }
 
 // resolveRun applies the --run precedence: flag → MRV_RUN_ID → newest run without an Error summary.

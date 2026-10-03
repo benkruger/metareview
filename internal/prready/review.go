@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -21,12 +22,12 @@ import (
 	"github.com/dsifry/metareview/internal/githubcontext"
 	"github.com/dsifry/metareview/internal/knowledge"
 	"github.com/dsifry/metareview/internal/markdown"
-	"github.com/dsifry/metareview/internal/mutation"
 	"github.com/dsifry/metareview/internal/repo"
 	"github.com/dsifry/metareview/internal/reviewers"
 	"github.com/dsifry/metareview/internal/reviewlog"
 	"github.com/dsifry/metareview/internal/reviewmanifest"
 	"github.com/dsifry/metareview/internal/reviewstate"
+	"github.com/dsifry/metareview/internal/rollback"
 	"github.com/dsifry/metareview/internal/runchain"
 	"github.com/dsifry/metareview/internal/shardpack"
 	"github.com/dsifry/metareview/internal/state"
@@ -48,8 +49,14 @@ type Options struct {
 	// MutationReportPaths are --mutation-report files: a mutation-testing engine's output,
 	// either mutation-testing-report-schema or gremlins JSON. Empty is the ordinary case.
 	MutationReportPaths []string
+	// MutationViews are --mutation-view names (spec §11.3): the evidence is judged per view.
+	MutationViews []string
 	// ShardWriter is the pack-writing seam; nil uses the real filesystem.
 	ShardWriter shardpack.Writer
+	// Incremental marks a review whose Base is a last-reviewed checkpoint (#176): the reviewers see only
+	// checkpoint..HEAD, but blockers stay scoped to the whole branch from its fork point — an open finding on a
+	// file changed before the checkpoint must not read as unrelated and stop blocking.
+	Incremental bool
 }
 
 type Result struct {
@@ -74,6 +81,7 @@ type runRecord struct {
 	AttemptNumber        int                 `json:"attemptNumber"`
 	MaxAttempts          int                 `json:"maxAttempts"`
 	BaseSHA              string              `json:"baseSha"`
+	RequestedBase        string              `json:"requestedBase,omitempty"`
 	HeadSHA              string              `json:"headSha"`
 	ContextPath          string              `json:"contextPackPath"`
 	ReviewPath           string              `json:"reviewLogPath"`
@@ -94,32 +102,27 @@ type runRecord struct {
 	ReusedFromRunID      string              `json:"reusedFromRunId,omitempty"`
 }
 
-type fileSnapshot struct {
-	existed bool
-	content []byte
-}
-
 var reviewerNames = []string{"pr-readiness-reviewer", "validation-reviewer", "security-reviewer", "code-quality-reviewer", "architecture-reviewer", "external-reviewer"}
 var runPRReadyReviewers = reviewers.RunPRReady
 
 // Collaborator seams. Each defaults to the real function so production is
 // unchanged; a test overrides one (with a t.Cleanup restore) to exercise a
 // cross-package error branch in Create that is otherwise unreachable through
-// realistic inputs. restoreSnapshots/snapshot deliberately keep os.* directly so
+// realistic inputs. Rollback (internal/rollback) keeps its own seams, never these, so
 // a mkdirAll/writeFile override in a Create-error test cannot corrupt rollback.
 var (
-	marshalJSON        = json.Marshal
-	planShards         = contextprofile.PlanShards
-	collectKnowledge   = knowledge.Collect
-	discoverLogs       = reviewlog.Discover
-	unresolvedBlocking = findings.UnresolvedBlocking
-	allFindingsFn      = findings.All
-	collectGitHub      = githubcontext.Collect
-	resolveChainFn     = runchain.Resolve
-	reconcileFindings  = findings.Reconcile
-	appendJSONL        = state.AppendJSONL
-	mkdirAll           = os.MkdirAll
-	writeFile          = os.WriteFile
+	marshalJSON       = json.Marshal
+	planShards        = contextprofile.PlanShards
+	collectKnowledge  = knowledge.Collect
+	discoverLogs      = reviewlog.Discover
+	scopedBlocking    = findings.ScopedBlocking
+	allFindingsFn     = findings.All
+	collectGitHub     = githubcontext.Collect
+	resolveChainFn    = runchain.Resolve
+	reconcileFindings = findings.Reconcile
+	appendJSONL       = state.AppendJSONL
+	mkdirAll          = os.MkdirAll
+	writeFile         = os.WriteFile
 )
 
 type reviewerInput struct {
@@ -233,6 +236,9 @@ func Create(root string, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if options.Incremental {
+		git.RequestedBase = reviewstate.LastReviewedBase
+	}
 	reviewGit := filterGeneratedGitContext(git)
 	dirtyFiles := workingTreeDirtyFiles(reviewGit)
 	analysisGit := reviewGit
@@ -252,6 +258,25 @@ func Create(root string, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	blockerScopePaths := reviewedPaths(analysisGit)
+	if options.Incremental {
+		forkPoint, forked, err := gitcontext.ForkPoint(root)
+		if err == nil && !forked {
+			err = fmt.Errorf("incremental pr-ready: HEAD has no fork point (no local main or master, or no commits of its own past it), so blockers cannot be scoped to the whole branch")
+		}
+		var whole gitcontext.Context
+		if err == nil {
+			whole, err = gitcontext.CollectWithExcludes(root, forkPoint, generatedMetareviewPathExcludes())
+		}
+		if err != nil {
+			return Result{}, err
+		}
+		wholeGit := filterGeneratedGitContext(whole)
+		if !options.IncludeWorkingTree {
+			wholeGit = branchOnlyGitContext(wholeGit)
+		}
+		blockerScopePaths = uniqueStrings(append(blockerScopePaths, reviewedPaths(wholeGit)...))
+	}
 	targetRecord := map[string]string{"type": "branch", "id": firstNonEmpty(git.Branch, git.HeadSHA)}
 	logs, err := discoverLogs(root)
 	if err != nil {
@@ -261,10 +286,18 @@ func Create(root string, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	blockers, err := unresolvedBlocking(root)
+	// A chained run's lineage also holds every earlier pr-ready run of this target over the same base..head as a run
+	// already in the chain (mr-mrf): a standalone re-run at that diff was the same review, and its open findings must
+	// be closable by the chain that repairs it — otherwise only an override could clear them. A run with no
+	// --previous-run adopts nothing: a fresh look at an unchanged diff never counts as a fix.
+	previousRunIDs = append(previousRunIDs, sameDiffPRReadyRunIDs(logs, targetRecord, previousRunIDs)...)
+	// Only this branch's blockers gate it (#178); the rest are counted in the log as an advisory.
+	blockers, elsewhere, err := scopedBlocking(root)
 	if err != nil {
 		return Result{}, err
 	}
+	blockers = slices.DeleteFunc(blockers, func(r findings.Record) bool { return !findings.InViewScope(r, options.MutationViews) })
+	elsewhere = slices.DeleteFunc(elsewhere, func(r findings.Record) bool { return !findings.InViewScope(r, options.MutationViews) })
 	// The full ledger (every status) lets the evidence renderer reconcile a
 	// historical review against how its findings were actually cleared (#40). Read
 	// before this run reconciles: the overrides/fixes that clear a historical
@@ -289,19 +322,20 @@ func Create(root string, options Options) (Result, error) {
 		Scope:            "pr-ready",
 		Target:           targetRecord,
 		PreviousRunIDs:   previousRunIDs,
-		HistoricalRunIDs: historicalPRReadyRunIDsForCurrentTarget(root, logs, targetRecord, git),
-		ChangedPaths:     reviewedPaths(analysisGit),
+		HistoricalRunIDs: append(historicalPRReadyRunIDsForCurrentTarget(root, logs, targetRecord, git), reviewstate.FlagTargetRunIDs(logs)...),
+		ChangedPaths:     blockerScopePaths,
 		CurrentTarget:    targetRecord,
 		LinkedTargets:    linkedTargets,
 	})
-	reviewLogs := append(latestLogsByTarget(projection.CurrentReviewLogs()), blockerLogs(projection.CurrentBlockers())...)
+	liveBlockers := withoutOwnPRReadyFindings(projection.CurrentBlockers(), targetRecord)
+	reviewLogs := append(latestLogsByTarget(projection.CurrentReviewLogs()), blockerLogs(liveBlockers)...)
 	blockingReviewLogs := gateReviewLogs(reviewLogs, allFindings)
 	prEvidence := RenderEvidence(EvidenceInput{
 		Summary:     branchSummary(analysisGit),
 		Validation:  validationLines(evidenceText),
 		TaskReviews: taskReviewEvidence(reviewLogs),
 		EpicReviews: epicReviewEvidence(reviewLogs),
-		Blockers:    blockerEvidence(projection.CurrentBlockers()),
+		Blockers:    blockerEvidence(liveBlockers),
 		GitHub:      ghCtx,
 		Findings:    allFindings,
 	})
@@ -312,10 +346,7 @@ func Create(root string, options Options) (Result, error) {
 	runsPath := filepath.Join(root, ".metareview", "runs.jsonl")
 	findingsPath := filepath.Join(root, ".metareview", "findings.jsonl")
 	findingsIndexPath := filepath.Join(root, "docs", "metareview", "FINDINGS.md")
-	snapshots := map[string]fileSnapshot{}
-	for _, path := range []string{contextPath, reviewPath, runsPath, findingsPath, findingsIndexPath} {
-		snapshots[path] = snapshot(path)
-	}
+	snapshots := rollback.GateOutputs(contextPath, reviewPath, runsPath, findingsPath, findingsIndexPath)
 
 	gateEffect := "advisory"
 	if report.Capabilities.Beads || report.Capabilities.Metaswarm {
@@ -331,7 +362,7 @@ func Create(root string, options Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	mutationContext, err := mutationContextFor(options.MutationReportPaths)
+	mutationContext, err := mutationContextFor(root, options.MutationReportPaths, options.MutationViews, !options.IncludeWorkingTree)
 	if err != nil {
 		return Result{}, err
 	}
@@ -349,7 +380,7 @@ func Create(root string, options Options) (Result, error) {
 	// A corrupt runs.jsonl never reaches here silently: the run projection above reads the same file and
 	// fails the whole review loudly with the parse error first (fail-closed). So a read error here can only
 	// mean "no marker" — treat it as absent.
-	if ev, ok, evErr := reviewstate.LatestReviewEvidence(root, "pr-ready", git.BaseSHA, git.HeadSHA); evErr == nil && ok {
+	if ev, ok, evErr := reviewstate.CurrentReviewEvidence(root, "pr-ready", git.BaseSHA, git.HeadSHA, gitcontext.ChangedSince(root)); evErr == nil && ok {
 		reviewerCtx.Adversarial.Present = true
 		reviewerCtx.Adversarial.Verdict = ev.AdjudicatedVerdict
 		reviewerCtx.Adversarial.Emulated = ev.IsEmulated()
@@ -437,6 +468,7 @@ func Create(root string, options Options) (Result, error) {
 				AttemptNumber:        chain.AttemptNumber,
 				MaxAttempts:          chain.MaxAttempts,
 				BaseSHA:              git.BaseSHA,
+				RequestedBase:        git.RequestedBase,
 				HeadSHA:              git.HeadSHA,
 				ContextPath:          contextRel,
 				ReviewPath:           reviewRel,
@@ -470,19 +502,23 @@ func Create(root string, options Options) (Result, error) {
 				ReusedFromRunID:      reused.RunID,
 				ReusedFromReviewPath: reused.Path,
 				HistoricalBlockers:   projection.HistoricalBlockers(),
+				ElsewhereBlockers:    len(elsewhere),
 			}
-			return writeFile(reviewPath, []byte(reviewMarkdown(runID, contextRel, options.PreviousRunID, gateEffect, reused.Verdict, reviewGit.ChangedFiles, nil, prEvidence, reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), meta)), 0o644)
+			return writeFile(reviewPath, []byte(reviewMarkdown(runID, contextRel, options.PreviousRunID, gateEffect, reused.Verdict, reviewGit.ChangedFiles, nil, prEvidence, joinSections(reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), mutationContext.FreshnessSection), meta)), 0o644)
 		}
 		reconciled, err := reconcileFindings(root, run, rawFindings, findings.Options{
-			PreviousRunID:  options.PreviousRunID,
-			PreviousRunIDs: previousRunIDs,
-			ResetRunIDs:    chain.ResetRunIDs,
+			PreviousRunID:    options.PreviousRunID,
+			PreviousRunIDs:   previousRunIDs,
+			ResetRunIDs:      chain.ResetRunIDs,
+			MutationEngines:  mutationContext.Engines(),
+			MutationViews:    mutationContext.Views,
+			MutationViewMaps: mutationContext.ViewMaps(),
 		})
 		if err != nil {
 			return err
 		}
 		counts := findings.CountByClass(reconciled.OpenFindings)
-		verdict, status, blocking, escalationReason := verdictForCounts(counts, gateEffect, chain.AttemptNumber, chain.MaxAttempts)
+		verdict, status, blocking, escalationReason := verdictForCounts(counts, gateEffect, chain.AttemptNumber, chain.MaxAttempts, findings.OnlyStaleBlockers(reconciled.OpenFindings))
 		result.Verdict = verdict
 		result.Blocking = blocking
 		record := runRecord{
@@ -497,6 +533,7 @@ func Create(root string, options Options) (Result, error) {
 			AttemptNumber:        chain.AttemptNumber,
 			MaxAttempts:          chain.MaxAttempts,
 			BaseSHA:              git.BaseSHA,
+			RequestedBase:        git.RequestedBase,
 			HeadSHA:              git.HeadSHA,
 			ContextPath:          contextRel,
 			ReviewPath:           reviewRel,
@@ -528,11 +565,12 @@ func Create(root string, options Options) (Result, error) {
 			WarningFindingCount:  counts.Warnings,
 			ReviewInputDigest:    reviewInputDigest,
 			HistoricalBlockers:   projection.HistoricalBlockers(),
+			ElsewhereBlockers:    len(elsewhere),
 		}
-		return writeFile(reviewPath, []byte(reviewMarkdown(runID, contextRel, options.PreviousRunID, gateEffect, verdict, reviewGit.ChangedFiles, reconciled.OpenFindings, prEvidence, reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), meta)), 0o644)
+		return writeFile(reviewPath, []byte(reviewMarkdown(runID, contextRel, options.PreviousRunID, gateEffect, verdict, reviewGit.ChangedFiles, reconciled.OpenFindings, prEvidence, joinSections(reviewmanifest.ShardedReviewMarkdown(manifest, aggregate), mutationContext.FreshnessSection), meta)), 0o644)
 	}()
 	if err != nil {
-		restoreSnapshots(snapshots)
+		snapshots.Restore()
 		removeEmptyDirs(root)
 		// The rollback error must not replace the error that caused the rollback.
 		if rollbackErr := packRollback(); rollbackErr != nil {
@@ -634,6 +672,36 @@ func resolveRunChain(root string, targetRecord map[string]string, options Option
 	return fallback, previousRunIDs, nil
 }
 
+// sameDiffPRReadyRunIDs are the pr-ready runs of targetRecord, outside chain, whose base..head is that of a run in
+// chain. A log's head and base come only from its authenticated local run record (reviewlog.Summary), so a committed or
+// hand-written log with no such record never qualifies, and an empty chain adopts nothing.
+func sameDiffPRReadyRunIDs(logs []reviewlog.Summary, targetRecord map[string]string, chain []string) []string {
+	have := map[string]bool{}
+	for _, id := range chain {
+		have[id] = true
+	}
+	want := reviewstate.TargetKey("pr-ready", targetRecord)
+	same := func(log reviewlog.Summary) bool {
+		return log.Kind == "pr-ready" && log.RunID != "" && log.HeadSHA != "" && log.BaseSHA != "" &&
+			log.RunRecordAuthenticated &&
+			reviewstate.TargetKey("pr-ready", log.TargetRecord) == want
+	}
+	diffs := map[[2]string]bool{}
+	for _, log := range logs {
+		if same(log) && have[log.RunID] {
+			diffs[[2]string{log.BaseSHA, log.HeadSHA}] = true
+		}
+	}
+	var ids []string
+	for _, log := range logs {
+		if same(log) && !have[log.RunID] && diffs[[2]string{log.BaseSHA, log.HeadSHA}] {
+			have[log.RunID] = true
+			ids = append(ids, log.RunID)
+		}
+	}
+	return ids
+}
+
 func authenticatedLegacyRootMaxAttempts(root string, logs []reviewlog.Summary, previousRunIDs []string, targetRecord map[string]string, git gitcontext.Context) int {
 	if len(previousRunIDs) == 0 {
 		return 0
@@ -722,6 +790,7 @@ func historicalPRReadyRunIDsForCurrentTarget(root string, logs []reviewlog.Summa
 	}
 	return ids
 }
+
 func legacyEscalatedPRReadyForTarget(root string, logs []reviewlog.Summary, targetRecord map[string]string, git gitcontext.Context) (string, bool) {
 	for _, log := range logs {
 		if log.RunID == "" || log.Kind != "pr-ready" || !strings.EqualFold(log.Verdict, "ESCALATED") {
@@ -957,11 +1026,18 @@ func reviewerLogs(logs []reviewlog.Summary) []reviewers.PRReviewLog {
 // already been resolved. The report still receives the unfiltered logs and
 // renders those historical records with their resolver, but a path overlap
 // cannot make a cleared finding block a new PR-ready target.
+//
+// The gate uses reviewstate.LogBlockersResolvedInLedger — strict about the log's BLOCKING findings
+// (an ID the ledger does not know, or fewer vouched than the run raised, keeps the log a gate input),
+// so resolving the IDs a ledger happens to know can never retire a log that also lists a blocker
+// nobody's ledger ever held (mr-ik7). It is deliberately not strict about the advisory/quoted IDs in
+// FindingIDs — those would otherwise block a log forever — and the rendered evidence keeps the plain
+// lenient reading (it renders, it does not gate).
 func gateReviewLogs(logs []reviewlog.Summary, ledger []findings.Record) []reviewlog.Summary {
 	byID := indexFindings(ledger)
 	result := make([]reviewlog.Summary, 0, len(logs))
 	for _, log := range logs {
-		if reconcileReview(FromReviewLog(log), byID).Resolved {
+		if reviewstate.LogBlockersResolvedInLedger(log, byID) {
 			continue
 		}
 		result = append(result, log)
@@ -1007,6 +1083,25 @@ func latestLogsByTarget(logs []reviewlog.Summary) []reviewlog.Summary {
 		return result[i].Target < result[j].Target
 	})
 	return result
+}
+
+// withoutOwnPRReadyFindings drops pr-ready's own earlier "Unresolved review blockers" findings
+// against this branch from what that same reviewer reads. The finding is derived entirely from other
+// blockers, so counting it as one made the gate block on itself: a standalone re-run at the same head
+// raised it against the branch, every later run inherited it under the same id and raised it again
+// from itself, and only an override could clear it. The blockers it summarised still pass through and
+// block on their own; other pr-ready findings (a stale mutation row this run does not re-check) and
+// task-done/epic-ready blockers are untouched, and the escalation lock is separate.
+func withoutOwnPRReadyFindings(blockers []findings.Record, target map[string]string) []findings.Record {
+	kept := make([]findings.Record, 0, len(blockers))
+	for _, blocker := range blockers {
+		if blocker.Scope == "pr-ready" && strings.HasPrefix(blocker.Fingerprint, findings.UnresolvedReviewBlockersPrefix) &&
+			findingTargetID(blocker.Target) == target["id"] {
+			continue
+		}
+		kept = append(kept, blocker)
+	}
+	return kept
 }
 
 func blockerLogs(blockers []findings.Record) []reviewlog.Summary {
@@ -1282,6 +1377,7 @@ func contextMarkdown(runID string, git gitcontext.Context, profile contextprofil
 		"Run ID: " + markdown.InlineCode(runID) + "\n\n" +
 		"## Git\n\n" +
 		"- Base: " + markdown.InlineCode(git.BaseSHA) + "\n" +
+		markdown.OptionalListItem("Requested base", git.RequestedBase) +
 		"- Head: " + markdown.InlineCode(git.HeadSHA) + "\n" +
 		"- Branch: " + markdown.InlineCode(git.Branch) + "\n" +
 		"- " + reviewlog.ReviewerInputDigestLabel + " " + markdown.InlineCode(reviewInputDigest) + "\n" +
@@ -1310,13 +1406,24 @@ type reviewMetadata struct {
 	ReusedFromRunID      string
 	ReusedFromReviewPath string
 	HistoricalBlockers   []findings.Record
+	// ElsewhereBlockers counts the unresolved blockers in this checkout's ledger that belong to another branch, or
+	// to none (#178): listed, never blocking.
+	ElsewhereBlockers int
 }
 
-func verdictForCounts(counts findings.ClassCounts, gateEffect string, attemptNumber, maxAttempts int) (string, string, bool, string) {
+func verdictForCounts(counts findings.ClassCounts, gateEffect string, attemptNumber, maxAttempts int, staleOnly bool) (string, string, bool, string) {
 	blocking := counts.Blocking > 0
 	nonBlocking := counts.Advisory > 0 || counts.FollowUp > 0 || counts.Warnings > 0
 	if blocking && attemptNumber >= maxAttempts {
+		// Spec §6.8: a chain blocked only by stale mutation evidence waits for a refresh, up to
+		// 2 × maxAttempts, before it escalates.
+		if staleOnly && attemptNumber < 2*maxAttempts {
+			return "NEEDS_REVISION", "needs-revision", true, ""
+		}
 		reason := fmt.Sprintf("blocking findings remain after attempt %d of %d", attemptNumber, maxAttempts)
+		if staleOnly {
+			reason = fmt.Sprintf("stale mutation evidence not refreshed after %d attempts", attemptNumber)
+		}
 		return "ESCALATED", "escalated", true, reason
 	}
 	if blocking {
@@ -1337,7 +1444,7 @@ func reviewMarkdown(runID, contextRel, previousRun, gateEffect, verdict string, 
 	executionMode := "deterministic-local"
 	reuseHeader := ""
 	reviewerResults := "## Reviewer Results\n\n| Reviewer | Verdict | Blocking | Notes |\n| --- | --- | ---: | --- |\n" +
-		reviewerTable(records) + "\n\n" + findingsMarkdown(records) + "\n"
+		findings.ReviewerTable(reviewerNames, records) + "\n\n" + findings.ClassifiedMarkdown(records, runID) + "\n"
 	if meta.ReusedFromRunID != "" {
 		executionMode = "deterministic-local-reused"
 		reuseHeader = "Reused verdict from: " + markdown.InlineCode(meta.ReusedFromRunID) + "\n\n"
@@ -1364,15 +1471,18 @@ func reviewMarkdown(runID, contextRel, previousRun, gateEffect, verdict string, 
 		"## Verdict\n\n" + verdict + "\n\n" + shardedReview +
 		reviewerResults +
 		"\n## Suggested PR Evidence\n\n" + prEvidence + "\n" +
-		repositoryHealthMarkdown(meta.HistoricalBlockers) +
+		repositoryHealthMarkdown(meta.HistoricalBlockers, meta.ElsewhereBlockers) +
 		runChainMarkdown(runID, verdict, meta)
 }
 
-func repositoryHealthMarkdown(records []findings.Record) string {
-	if len(records) == 0 {
+func repositoryHealthMarkdown(records []findings.Record, elsewhere int) string {
+	if len(records) == 0 && elsewhere == 0 {
 		return ""
 	}
-	lines := make([]string, 0, len(records))
+	lines := make([]string, 0, len(records)+1)
+	if elsewhere > 0 {
+		lines = append(lines, fmt.Sprintf("- Open on other branches: %d unresolved blocker(s) in this checkout's findings ledger belong to another live branch, which they still block, or to none (merged and deleted, or outside this history), where they block nothing; none blocks this branch.", elsewhere))
+	}
 	for _, record := range records {
 		title := strings.TrimSpace(strings.NewReplacer("\n", " ", "\r", " ").Replace(record.Title))
 		if title == "" {
@@ -1415,91 +1525,6 @@ func knowledgeMarkdown(context knowledge.Context) string {
 	return service + "\n\nKnowledge facts:\n\n" + facts
 }
 
-func reviewerTable(records []findings.Record) string {
-	lines := make([]string, 0, len(reviewerNames))
-	for _, reviewer := range reviewerNames {
-		var blockers, nonBlockers []string
-		for _, record := range records {
-			if record.Reviewer != reviewer {
-				continue
-			}
-			counts := findings.CountByClass([]findings.Record{record})
-			if counts.Blocking > 0 {
-				blockers = append(blockers, record.Title)
-			} else {
-				nonBlockers = append(nonBlockers, record.Title)
-			}
-		}
-		verdict := "PASS"
-		note := "No blocking findings."
-		if len(blockers) > 0 {
-			verdict = "NEEDS_REVISION"
-			note = strings.Join(blockers, "; ")
-		} else if len(nonBlockers) > 0 {
-			verdict = "PASS_ADVISORY"
-			note = strings.Join(nonBlockers, "; ")
-		}
-		lines = append(lines, fmt.Sprintf("| %s | %s | %d | %s |", reviewer, verdict, len(blockers), note))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func findingsMarkdown(records []findings.Record) string {
-	return classifiedFindingsMarkdown(records)
-}
-
-func classifiedFindingsMarkdown(records []findings.Record) string {
-	sections := []struct {
-		title string
-		label string
-	}{
-		{title: "## Blocking Findings", label: "blocking"},
-		{title: "## Advisory Findings", label: "advisory"},
-		{title: "## Follow-up Findings", label: "follow-up"},
-		{title: "## Warnings", label: "warning"},
-	}
-	var output []string
-	for _, section := range sections {
-		var items []string
-		for _, record := range records {
-			if classForDisplay(record) != section.label {
-				continue
-			}
-			items = append(items, "### "+record.ID+": "+record.Title+"\n\n"+
-				"- Reviewer: "+record.Reviewer+"\n"+
-				"- Severity: "+record.Severity+"\n"+
-				"- Classification: "+record.Classification+"\n"+
-				"- Finding: "+record.Finding+"\n"+
-				"- Expected: "+record.Expected+"\n"+
-				"- Found: "+record.Found+"\n"+
-				"- Recommendation: "+record.Recommendation+"\n")
-		}
-		body := "No findings in this class.\n"
-		if len(items) > 0 {
-			body = strings.Join(items, "\n")
-		}
-		output = append(output, section.title+"\n\n"+body)
-	}
-	return strings.Join(output, "\n\n")
-}
-
-func classForDisplay(record findings.Record) string {
-	counts := findings.CountByClass([]findings.Record{record})
-	// An if-chain rather than a tagless `switch {}`: Go's coverage tool emits no counter for a
-	// tagless-switch case expression, so its guards read as permanently uncovered and mutation testing
-	// can never exercise them. As plain `if` conditions they are both covered and mutation-killable.
-	if counts.Blocking > 0 {
-		return "blocking"
-	}
-	if counts.Advisory > 0 {
-		return "advisory"
-	}
-	if counts.FollowUp > 0 {
-		return "follow-up"
-	}
-	return "warning"
-}
-
 func runChainMarkdown(runID, verdict string, meta reviewMetadata) string {
 	if verdict != "ESCALATED" {
 		return ""
@@ -1513,25 +1538,6 @@ func runChainMarkdown(runID, verdict string, meta reviewMetadata) string {
 	builder.WriteString("\n## Unresolved Blocker Summary\n\n")
 	fmt.Fprintf(&builder, "- Blocking: %d\n- Advisory: %d\n- Follow-up: %d\n- Warnings: %d\n", meta.BlockingFindingCount, meta.AdvisoryFindingCount, meta.FollowUpFindingCount, meta.WarningFindingCount)
 	return builder.String()
-}
-
-func snapshot(path string) fileSnapshot {
-	bytes, err := os.ReadFile(path)
-	if err != nil {
-		return fileSnapshot{existed: false}
-	}
-	return fileSnapshot{existed: true, content: bytes}
-}
-
-func restoreSnapshots(snapshots map[string]fileSnapshot) {
-	for path, snapshot := range snapshots {
-		if snapshot.existed {
-			_ = os.MkdirAll(filepath.Dir(path), 0o755)
-			_ = os.WriteFile(path, snapshot.content, 0o644)
-			continue
-		}
-		_ = os.Remove(path)
-	}
 }
 
 func removeEmptyDirs(root string) {
@@ -1604,13 +1610,17 @@ func shardTargetID(git gitcontext.Context) string {
 // mutationContextFor loads the declared mutation reports. An unreadable or unrecognised report is
 // an error that stops the review, never a skipped file: a mutation gate that quietly drops a
 // report is a gate that passes because it looked at less.
-func mutationContextFor(paths []string) (reviewers.MutationContext, error) {
-	if len(paths) == 0 {
-		return reviewers.MutationContext{}, nil
+func mutationContextFor(root string, paths, views []string, head bool) (reviewers.MutationContext, error) {
+	return reviewers.LoadMutationContext(root, paths, views, "pr-ready", head)
+}
+
+// joinSections joins the non-empty sections that follow the verdict line.
+func joinSections(sections ...string) string {
+	var kept []string
+	for _, s := range sections {
+		if s != "" {
+			kept = append(kept, s)
+		}
 	}
-	reports, err := mutation.LoadAll(paths)
-	if err != nil {
-		return reviewers.MutationContext{}, err
-	}
-	return reviewers.MutationContext{Reports: reports}, nil
+	return strings.Join(kept, "\n\n")
 }

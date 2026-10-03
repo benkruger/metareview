@@ -73,8 +73,8 @@ func RealDeps() Deps {
 		CodexExec:  realCodexExec,
 		ClaudeExec: realClaudeExec,
 		HTTP:       newHTTPClient(),
-		Store:      func(root string) run.RunStore { return run.NewJSONLStore(root, run.Options{}) },
-		Sidecar:    func(root string) machine.Sidecar { return machine.FSSidecar{Root: root} },
+		Store:      func(common string) run.RunStore { return run.NewCommonDirStore(common, run.Options{}) },
+		Sidecar:    func(common string) machine.Sidecar { return machine.FSSidecar{Root: common, CommonDir: true} },
 		ExportFS:   export.OSFS{},
 		MockLoad:   mockai.Load,
 		Workflows:  workflows.Read,
@@ -134,9 +134,9 @@ func realClaudeExec(ctx context.Context, dir string, args []string, stdin string
 // metareview never handles the token itself.
 func realCodexExec(ctx context.Context, dir string, args []string, stdin string) ([]byte, int, error) {
 	cmd := exec.CommandContext(ctx, codexBin, args...)
-	// Empty means inherit, which is metareview's own repository. A caller that has materialized
-	// an evidence tree passes it here so that tree is what relative paths resolve against. This
-	// does not stop the CLI reading elsewhere - cmd.Dir is a starting point, not a jail.
+	// The judge always passes a directory: a fresh isolated one (judge.isolatedDir), or a
+	// materialized evidence tree a caller confined it to. This does not stop the CLI reading
+	// elsewhere - cmd.Dir is a starting point, not a jail.
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(stdin)
 	var out bytes.Buffer

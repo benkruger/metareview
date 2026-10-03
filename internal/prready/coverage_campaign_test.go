@@ -234,33 +234,17 @@ func TestUniquePathsAdvancesPastCollision(t *testing.T) {
 func TestRepositoryHealthMarkdownDefaultsEmptyTitle(t *testing.T) {
 	got := repositoryHealthMarkdown([]findings.Record{
 		{Title: "   ", Target: map[string]string{"id": "TASK-7"}},
-	})
+	}, 0)
 	if !strings.Contains(got, "Unresolved historical finding (TASK-7)") {
 		t.Fatalf("a blank title must default and keep the target: %q", got)
 	}
-	if repositoryHealthMarkdown(nil) != "" {
+	if repositoryHealthMarkdown(nil, 0) != "" {
 		t.Fatal("no records must render nothing")
 	}
-}
-
-func TestRestoreSnapshotsWritesAndRemoves(t *testing.T) {
-	dir := t.TempDir()
-	existing := filepath.Join(dir, "nested", "existing.md")
-	created := filepath.Join(dir, "created.md")
-	// A file that "did not exist" before the run must be removed on restore.
-	if err := os.WriteFile(created, []byte("should be removed"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	restoreSnapshots(map[string]fileSnapshot{
-		existing: {existed: true, content: []byte("restored")},
-		created:  {existed: false},
-	})
-	body, err := os.ReadFile(existing)
-	if err != nil || string(body) != "restored" {
-		t.Fatalf("an existed snapshot must be rewritten: body=%q err=%v", body, err)
-	}
-	if _, err := os.Stat(created); !os.IsNotExist(err) {
-		t.Fatal("a not-existed snapshot must be removed")
+	// #178: blockers that belong to other branches are counted, alone or beside historical ones.
+	if got := repositoryHealthMarkdown(nil, 2); !strings.Contains(got, "## Repository Health Advisory") || !strings.Contains(got, "Open on other branches: 2 ") ||
+		!strings.Contains(got, "where they block nothing") {
+		t.Fatalf("other-branch blockers must be listed as an advisory: %q", got)
 	}
 }
 
@@ -687,10 +671,10 @@ func TestCreateCollaboratorSeamErrors(t *testing.T) {
 			resolveChainFn = func(string, runchain.Options) (runchain.Decision, error) { return runchain.Decision{}, errSeam }
 			t.Cleanup(func() { resolveChainFn = orig })
 		}},
-		{"unresolvedBlocking", func(t *testing.T) {
-			orig := unresolvedBlocking
-			unresolvedBlocking = func(string) ([]findings.Record, error) { return nil, errSeam }
-			t.Cleanup(func() { unresolvedBlocking = orig })
+		{"scopedBlocking", func(t *testing.T) {
+			orig := scopedBlocking
+			scopedBlocking = func(string) ([]findings.Record, []findings.Record, error) { return nil, nil, errSeam }
+			t.Cleanup(func() { scopedBlocking = orig })
 		}},
 		{"allFindings", func(t *testing.T) {
 			orig := allFindingsFn

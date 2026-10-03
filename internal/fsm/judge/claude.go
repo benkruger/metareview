@@ -79,6 +79,20 @@ func (j *claudeJudge) Call(ctx context.Context, r Request) (v Verdict, err error
 		// remains a denial rather than a hang in a headless run.
 		"--disallowed-tools", "*",
 		"--permission-mode", "dontAsk",
+		// Behind the isolated working directory (isolatedDir): load the user's settings only,
+		// never a project's or a local override, and no MCP server that is not passed explicitly
+		// (none is). --bare would also skip hooks but skips the keychain, and with it the OAuth
+		// session this transport exists to use.
+		"--setting-sources", "user",
+		// The user's hooks and plugins run in every claude session, this one included: a Stop hook
+		// that blocked after the verdict made the judge answer the hook's notice instead of the
+		// finding (#193). Disable them through a settings overlay (--bare is not an option, for the
+		// reason above); disableAllHooks covers hooks defined in settings and by installed plugins.
+		"--settings", `{"disableAllHooks":true}`,
+		"--strict-mcp-config",
+		// A judge call is not a session: nothing to resume, and with a fresh directory per
+		// attempt a saved transcript would leave one project directory behind per call.
+		"--no-session-persistence",
 		// The system prompt must always be passed. Without it `claude -p` can
 		// silently fall back to Haiku for the work turn even with --model set —
 		// the judge would then be a different model than the one recorded in the
@@ -105,11 +119,19 @@ func (j *claudeJudge) Call(ctx context.Context, r Request) (v Verdict, err error
 			case <-j.clock.After(backoff(classBackoff, attempt-1)):
 			}
 		}
-		actx, cancel := context.WithTimeout(ctx, j.timeout())
-		stdout, code, execErr := j.exec(actx, "", args, user)
-		cancel()
+		dir, cleanup, dirErr := isolatedDir()
+		if dirErr != nil {
+			lastErr = errs.E(CodeJudgeTransport, "claude could not be given an isolated working directory: "+dirErr.Error(), "provider", "claude-cli")
+			continue
+		}
+		stdout, code, execErr := func() ([]byte, int, error) {
+			defer cleanup() // deferred: a panic in the seam must not leave the directory behind
+			actx, cancel := context.WithTimeout(ctx, j.timeout())
+			defer cancel()
+			return j.exec(actx, dir, args, user)
+		}()
 
-		text, tokens, found, transient := parseClaudeResult(stdout)
+		text, turns, tokens, found, transient := parseClaudeResult(stdout)
 		v.Tokens = v.Tokens.Add(tokens)
 		switch {
 		case execErr != nil:
@@ -129,7 +151,28 @@ func (j *claudeJudge) Call(ctx context.Context, r Request) (v Verdict, err error
 		default:
 			v.Raw = text
 			v.Parsed, v.Decision, v.Confidence, v.ParseError = Parse(r.Kind, text)
-			return v, nil
+			// Only a reported count of exactly one is a verifiable single answer. The JSON envelope
+			// exposes only the final result, so the turn count is the one signature of a continuation
+			// (#193: a Stop hook or plugin spoke after the judge answered and the turn went on to a
+			// second answer). Any other value is not that single answer and is retried, then returned as
+			// unparseable, which every caller treats fail-closed. The supported CLI reports num_turns in
+			// every --output-format json envelope (live-verified at claude 2.1.285, 2026-09-30), so an
+			// absent or zero count means an envelope this transport does not recognise - refusing it is
+			// the safe reading, not accepting a verdict whose provenance cannot be checked.
+			if turns != nil && *turns == 1 {
+				return v, nil
+			}
+			capped, _ := run.CapText(text, run.MaxShort)
+			v.Parsed, v.Decision, v.Confidence = nil, r.Kind == KindStillPresent, 0
+			switch {
+			case turns == nil:
+				v.ParseError = "the claude result reported no turn count, so a hook or plugin continuation cannot be ruled out; raw: " + capped
+			case *turns == 0:
+				v.ParseError = "the claude result reported zero turns, which is not a single answer; raw: " + capped
+			default:
+				v.ParseError = "the turn continued past a complete verdict (a hook or plugin spoke in the judge's session); raw: " + capped
+			}
+			lastErr = nil
 		}
 	}
 	return v, lastErr
@@ -152,11 +195,14 @@ func validateClaude(model, effort string, calibration bool) error {
 }
 
 // claudeResult is the subset of the --output-format json document this provider
-// reads: the result text, the error flag, and the turn's usage.
+// reads: the result text, the error flag, the turn count, and the turn's usage.
+// NumTurns is a pointer so an ABSENT num_turns (no continuation signal) is
+// distinguishable from a present zero; neither is a verifiable single answer.
 type claudeResult struct {
-	IsError bool   `json:"is_error"`
-	Result  string `json:"result"`
-	Usage   *struct {
+	IsError  bool   `json:"is_error"`
+	NumTurns *int   `json:"num_turns"`
+	Result   string `json:"result"`
+	Usage    *struct {
 		Input      int64 `json:"input_tokens"`
 		CacheCre   int64 `json:"cache_creation_input_tokens"`
 		CacheRead  int64 `json:"cache_read_input_tokens"`
@@ -167,7 +213,7 @@ type claudeResult struct {
 	} `json:"usage"`
 }
 
-// parseClaudeResult pulls the result text and the turn's token usage out of the
+// parseClaudeResult pulls the result text, the turn count and the turn's token usage out of the
 // CLI's JSON document. found is false for a body that is not JSON, carries no
 // result text, or declares is_error. transient is true when the result string
 // is a server-side "API Error: 5.." report (see Call) — checked independently
@@ -180,10 +226,10 @@ type claudeResult struct {
 // subset of it. TokenTotals.Total() sums every field, so the categories are
 // made disjoint here exactly as the codex arm does; summing only input+output
 // would report the scaffolding tax as zero and undercount ~4000x.
-func parseClaudeResult(stdout []byte) (text string, tokens run.TokenTotals, found, transient bool) {
+func parseClaudeResult(stdout []byte) (text string, turns *int, tokens run.TokenTotals, found, transient bool) {
 	var r claudeResult
 	if json.Unmarshal(stdout, &r) != nil {
-		return "", run.TokenTotals{}, false, false
+		return "", nil, run.TokenTotals{}, false, false
 	}
 	if r.Usage != nil {
 		var thinking int64
@@ -205,5 +251,5 @@ func parseClaudeResult(stdout []byte) (text string, tokens run.TokenTotals, foun
 	// attempt (is_error + "API Error: 5..") still costs tokens and is still a
 	// retryable transport error, and is_error's tokens still count toward the
 	// attempt that spent them.
-	return text, tokens, text != "" && !r.IsError, strings.HasPrefix(strings.TrimSpace(text), "API Error: 5")
+	return text, r.NumTurns, tokens, text != "" && !r.IsError, strings.HasPrefix(strings.TrimSpace(text), "API Error: 5")
 }

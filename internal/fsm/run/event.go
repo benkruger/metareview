@@ -64,6 +64,8 @@ type InitData struct {
 	RepoRoot       string            `json:"repo_root"`
 	WorkDir        string            `json:"work_dir"`
 	BaseSHA        string            `json:"base_sha"`
+	RequestedBase  string            `json:"requested_base,omitempty"` // --base as typed ("" = default), beside the SHA it resolved to (#175)
+	Branch         string            `json:"branch,omitempty"`         // the branch the run is for (#177): checked out at init, or --for-branch; "" = legacy
 	Head           string            `json:"head"`
 	InitialState   State             `json:"initial_state"`
 	InitialKind    Kind              `json:"initial_kind,omitempty"`
@@ -71,6 +73,10 @@ type InitData struct {
 	ParentRunID    string            `json:"parent_run_id,omitempty"`
 	Lineage        []string          `json:"lineage"`
 	ForkedAtSeq    int64             `json:"forked_at_seq,omitempty"`
+	// Writer is the metareview version that wrote the run (#180; "" = before 0.14). A reader older than the writer's
+	// minor version refuses the run (ReasonNewerWriter) rather than misread it; a reader from before 0.14 refuses it
+	// already, as an init payload with an unknown field.
+	Writer string `json:"writer,omitempty"`
 }
 
 // TreeData is a working-tree snapshot carrier.
